@@ -1,0 +1,19 @@
+[package]
+name    = "app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "alloy"
+path = "src/main.rs"
+
+[dependencies]
+core.path      = "../../crates/core"
+markdown.path  = "../../crates/markdown"
+
+ratatui.workspace            = true
+crossterm.workspace          = true
+anyhow.workspace             = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+scopeguard.workspace         = true

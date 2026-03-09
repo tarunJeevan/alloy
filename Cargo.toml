@@ -1,0 +1,27 @@
+[workspace]
+members = [
+  "crates/app",
+  "crates/core",
+  "crates/markdown"
+]
+resolver = "2"
+
+[workspace.dependencies]
+# TUI + terminal
+ratatui   = "0.30.0"
+crossterm = "0.29.0"
+
+# Error handling
+anyhow    = "1.0.102"
+thiserror = "2.0.18"
+
+# Logging
+tracing            = "0.1.44"
+tracing-subscriber = {version = "0.3.22", features = ["env-filter"]}
+
+# Serialization
+serde = {version = "1.0.228", features = ["derive"]}
+toml = "1.0.6"
+
+# Utilities
+scopeguard = "1.2.0"
