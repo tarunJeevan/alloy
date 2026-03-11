@@ -1,147 +1,217 @@
-use anyhow::Result;
+#[macro_use(defer_on_unwind)]
+extern crate scopeguard;
+
+mod app_state;
+mod cli;
+
+use std::io;
+use std::process;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    DefaultTerminal,
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Style},
-    text::Line,
-    widgets::{Block, Borders, Paragraph},
-};
-use std::{
-    io::{self},
-    panic,
-    time::Duration,
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tracing::info;
-// ---------------------------------------------------------------------------
-// Terminal lifecycle helpers
-// ---------------------------------------------------------------------------
 
-/// Restores the terminal to its original state.
-/// Called both on clean exit AND from the panic hook  must be idempotent.
+use alloy_core::{config::Config, document::Document};
+use app_state::AppState;
+use cli::CliArgs;
+
+// Terminal lifecycle
+
+/// Restore the terminal to its normal state.
+///
+/// Called from both the clean exit path and the panic hook.
+/// Safe to call multiple times (crossterm silently ignores double-disable).
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stderr(), LeaveAlternateScreen);
 }
 
-/// A guard that calls `restore_terminal()` when dropped.
-/// This guarantees cleanup even if an early `?` propagates before the main loop ends.
-struct TerminalGuard;
+// Entry point
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
+fn main() {
+    // 1. Logging - initialise before anything else so boot messages are captured.
+    //    Controlled via RUST_LOG env var.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        // Log to stderr so it does not interfere with the alternate screen.
+        .with_writer(io::stderr)
+        .init();
+
+    // 2. Panic hook - must be installed before raw mode is entered.
+    std::panic::set_hook(Box::new(|info| {
         restore_terminal();
+        eprintln!("\nalloy panicked: {info}");
+    }));
+
+    if let Err(err) = run() {
+        restore_terminal();
+        eprintln!("error: {err:#}");
+        process::exit(1);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+fn run() -> Result<()> {
+    // CLI args
+    let args = CliArgs::parse();
 
-fn main() -> Result<()> {
-    // Logging - initialise before anything else so all startup events are captured. Output goes to a file in debug builds to avoid corrupting the TUI surface.
-    init_logging();
+    // Config loading
+    let config = Config::load().context("failed to load configuration")?;
 
-    // Panic hook - must be installed BEFORE raw mode so that any panic during setup is also handled cleanly.
-    let original_hook = panic::take_hook();
-    panic::set_hook(Box::new(move |info| {
+    info!(engine = ?config.markdown.engine, "config loaded");
+
+    // Document loading
+    let document = match &args.file {
+        Some(path) => {
+            if !path.exists() {
+                // Non-existent path: create a new empty document associated with that path.
+                // The file will be created on first save.
+                info!(path = %path.display(), "file not found; starting empty buffer");
+                let mut doc = Document::empty();
+                doc.path = Some(path.clone());
+                doc
+            } else {
+                Document::from_path(path)
+                    .with_context(|| format!("failed to open '{}'", path.display()))?
+            }
+        }
+        None => Document::empty(),
+    };
+
+    // Application state
+    let mut state = AppState::new(config, document);
+
+    // Terminal setup
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stderr = io::stderr();
+    execute!(stderr, EnterAlternateScreen).context("failed to enter alternate screen")?;
+
+    // Use a scopeguard so the terminal is always restored even if an error propagates out of the event loop.
+    defer_on_unwind! {
         restore_terminal();
-        original_hook(info);
-    }));
+    }
 
-    // Enter raw mode + alternate screen
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(io::stderr());
+    let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    // TerminalGuard ensures LeaveAlternateScreen + disable_raw_mode on any exit path (including early ? returns below).
-    let _guard = TerminalGuard;
+    // Event loop
+    while !state.should_quit {
+        terminal.draw(|frame| render(frame, &state))?;
 
-    // Build the ratatui terminal and run the event loop.
-    let terminal = ratatui::init();
-    let result = run(terminal);
-
-    // _guard drops here → restore_terminal() called automatically.
-
-    // Surface any error AFTER terminal is restored so it prints cleanly.
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Event loop
-// ---------------------------------------------------------------------------
-
-fn run(mut terminal: DefaultTerminal) -> Result<()> {
-    info!("Alloy starting...");
-
-    loop {
-        terminal.draw(|frame| {
-            let area = frame.area();
-
-            // Outer block
-            let block = Block::default()
-                .title(" alloy-editor ")
-                .title_alignment(Alignment::Center)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
-
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-
-            // Placeholder content
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
-                .split(inner);
-
-            let placeholder = Paragraph::new("No file open. Press 'q' to quit.")
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Gray));
-            frame.render_widget(placeholder, chunks[0]);
-
-            let status = Paragraph::new(Line::from(vec![
-                ratatui::text::Span::styled(
-                    " NORMAL ",
-                    Style::default().fg(Color::Black).bg(Color::Blue),
-                ),
-                ratatui::text::Span::raw(" tui-md-editor v0.1.0"),
-            ]));
-            frame.render_widget(status, chunks[1]);
-        })?;
-
-        // Poll with a timeout so the loop stays responsive
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') => {
-                        info!("Quit requested");
-                        break;
+                Event::Key(key) => {
+                    match (key.code, key.modifiers) {
+                        // Quit on `q` (Normal mode placeholder) or Ctrl+c.
+                        (KeyCode::Char('q'), KeyModifiers::NONE)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            state.should_quit = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
+                Event::Resize(_, _) => {
+                    // Ratatui redraws on the next frame automatically.
+                }
                 _ => {}
             }
         }
     }
 
+    // Clean exit
+    restore_terminal();
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Logging setup
-// ---------------------------------------------------------------------------
+// Rendering
 
-fn init_logging() {
-    use tracing_subscriber::{EnvFilter, fmt};
+fn render(frame: &mut ratatui::Frame, state: &AppState) {
+    let area = frame.area();
 
-    // In a TUI app, writing logs to stderr would corrupt the display. Write to a file instead; controlled via RUST_LOG env var.
-    // Example: RUST_LOG=debug cargo run 2>alloy.log
-    fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(io::stderr)
-        .with_ansi(false)
-        .init();
+    // Vertical split: editor body (top) + status bar (bottom, 1 line).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    // Editor placeholder
+    let editor_block = Block::default().borders(Borders::ALL).title(Span::styled(
+        format!(" {} ", state.status_filename()),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let help_text = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("alloy", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" - TUI Markdown editor"),
+        ]),
+        Line::from(""),
+        Line::from("  Press q to quit."),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Engine: "),
+            Span::styled(
+                format!("{:?}", state.config.markdown.engine),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  GFM:    "),
+            Span::styled(
+                state.config.markdown.extensions.gfm.to_string(),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+    ])
+    .block(editor_block)
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(help_text, chunks[0]);
+
+    // Status bar
+    let mode_label = Span::styled(
+        " NORMAL ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let file_label = Span::styled(
+        format!(" {} ", state.status_filename()),
+        Style::default().fg(Color::White),
+    );
+
+    let stats_label = Span::styled(
+        format!(
+            " {}L {}C ",
+            state.document.line_count(),
+            state.document.char_count(),
+        ),
+        Style::default().fg(Color::DarkGray),
+    );
+
+    let status_bar = Paragraph::new(Line::from(vec![mode_label, file_label, stats_label]))
+        .style(Style::default().bg(Color::DarkGray));
+
+    frame.render_widget(status_bar, chunks[1]);
 }

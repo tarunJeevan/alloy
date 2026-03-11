@@ -1,5 +1,5 @@
 [package]
-name    = "app"
+name = "app"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,12 +8,15 @@ name = "alloy"
 path = "src/main.rs"
 
 [dependencies]
-core.path      = "../../crates/core"
-markdown.path  = "../../crates/markdown"
+alloy-core.path = "../../crates/core"
+markdown.path = "../../crates/markdown"
 
-ratatui.workspace            = true
-crossterm.workspace          = true
-anyhow.workspace             = true
-tracing.workspace            = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
-scopeguard.workspace         = true
+serde.workspace = true
+
+scopeguard = "1.2.0"
