@@ -1,6 +1,7 @@
 #[macro_use(defer_on_unwind)]
 extern crate scopeguard;
 
+mod app;
 mod app_state;
 mod cli;
 
@@ -82,15 +83,15 @@ fn run() -> Result<()> {
                 // Non-existent path: create a new empty document associated with that path.
                 // The file will be created on first save.
                 info!(path = %path.display(), "file not found; starting empty buffer");
-                let mut doc = Document::empty();
+                let mut doc = Document::new();
                 doc.path = Some(path.clone());
                 doc
             } else {
-                Document::from_path(path)
+                Document::open(path)
                     .with_context(|| format!("failed to open '{}'", path.display()))?
             }
         }
-        None => Document::empty(),
+        None => Document::new(),
     };
 
     // Application state
