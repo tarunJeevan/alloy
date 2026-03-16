@@ -42,4 +42,8 @@ pub enum CoreError {
     /// The file exists but is not valid UTF-8.
     #[error("Document error: File is not valid UTF-8: {path}")]
     DocumentEncoding { path: PathBuf },
+
+    /// The file does not exist - create new file at path.
+    #[error("Document error: No file path set - use save_as() instead")]
+    DocumentNoPath,
 }
