@@ -4,8 +4,8 @@ resolver = "2"
 
 [workspace.dependencies]
 # TUI + terminal
-ratatui = "0.30.0"
-crossterm = "0.29.0"
+ratatui = "0.29.0"
+crossterm = "0.28.1"
 
 # Error handling
 anyhow = "1.0.102"

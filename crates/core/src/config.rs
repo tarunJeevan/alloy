@@ -1,14 +1,14 @@
-// Application configuration.
-//
-// The config is stored as TOML and lives at the platform-appropriate path:
-//
-// | Platform | Path |
-// |----------|------|
-// | Linux    | `$XDG_CONFIG_HOME/alloy/config.toml` (falls back to `~/.config`) |
-// | macOS    | `$~/Library/Application Support/alloy/config.toml` |
-// | Windows  | `%APPDATA%\alloy\config.toml` |
-//
-// On first run, the default config is written to disk so the user has a template to edit.
+//! Application configuration.
+//!
+//! The config is stored as TOML and lives at the platform-appropriate path:
+//!
+//! | Platform | Path |
+//! |----------|------|
+//! | Linux    | `$XDG_CONFIG_HOME/alloy/config.toml` (falls back to `~/.config`) |
+//! | macOS    | `$~/Library/Application Support/alloy/config.toml` |
+//! | Windows  | `%APPDATA%\alloy\config.toml` |
+//!
+//! On first run, the default config is written to disk so the user has a template to edit.
 
 use std::path::{Path, PathBuf};
 
@@ -64,6 +64,7 @@ impl Default for Config {
 
 /// Visual appearance settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ThemeConfig {
     /// Name of the built-in color theme to use.
     /// Available: "default", "nord", "gruvbox-dark"
@@ -93,6 +94,7 @@ impl Default for ThemeConfig {
 ///
 /// The defaults reflect Vim/Helix conventions. All fields are `Option<String>` so the user only needs to specify the bindings they want to override; `None` means "use the built-in default".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct KeymapConfig {
     /// Enter insert mode (default: `"i"`)
     pub enter_insert: Option<String>,
@@ -125,10 +127,15 @@ pub struct KeymapConfig {
 
 /// Editing-behavior settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EditorConfig {
     /// Milliseconds to wait after the last keystroke before triggering a preview re-render.
     /// Lower values feel more responsive; higher values reduce CPU usage on slow machines.
     pub preview_debounce_ms: u64,
+
+    /// Milliseconds to wait for a second key in a multi-key Normal-mode sequence (e.g. `g g`),
+    /// If the timeout expires before the next key arrives, the pending key is dispatched individually.
+    pub sequence_timeout_ms: u64,
 
     /// Show line numbers in the editor pane.
     pub line_numbers: bool,
@@ -146,6 +153,7 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             preview_debounce_ms: 150,
+            sequence_timeout_ms: 500,
             line_numbers: true,
             tab_width: 4,
             search_case_insensitive: true,
@@ -159,6 +167,7 @@ impl Default for EditorConfig {
 
 /// Markdown parsing and rendering settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MarkdownConfig {
     /// The parser backend used for terminal preview rendering.
     pub engine: MarkdownEngine,
@@ -190,6 +199,7 @@ pub enum MarkdownEngine {
 
 /// Feature flags for Markdown dialect extensions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExtensionConfig {
     /// GitHub Flavored Markdown (tables, task lists, strikethrough, autolinks).
     /// On by default.
@@ -225,6 +235,7 @@ impl Default for ExtensionConfig {
 
 /// Layout and visual-behavior settings for the TUI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     /// Percentage of the terminal width given to the editor pane when the preview is visible. The preview takes the remainder.
     /// Valid range: 10-98
