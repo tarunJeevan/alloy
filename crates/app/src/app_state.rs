@@ -7,6 +7,7 @@ use alloy_core::{config::Config, document::Document};
 
 /// The complete runtime state of the editor.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AppState {
     /// Loaded (or default) configuration.
     pub config: Config,
@@ -20,6 +21,7 @@ pub struct AppState {
 
 impl AppState {
     /// Create a new `AppState` with the given config and document.
+    #[allow(dead_code)]
     pub fn new(config: Config, document: Document) -> Self {
         Self {
             config,
@@ -31,6 +33,7 @@ impl AppState {
     /// The string shown in the status bar for the open file.
     ///
     /// Appends `[+]` when the document has unsaved changes.
+    #[allow(dead_code)]
     pub fn status_filename(&self) -> String {
         let name = self.document.display_name();
         if self.document.modified {
