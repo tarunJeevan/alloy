@@ -48,6 +48,7 @@ dependencies = [
  "ratatui",
  "scopeguard",
  "serde",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "tui-textarea",

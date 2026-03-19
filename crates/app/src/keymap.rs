@@ -6,7 +6,12 @@
 //!   1. Definite match - return the action and clear the buffer.
 //!   2. Prefix match - a longer sequence starting with the current buffer exists; hold and wait for the next key (or timeout).
 //!   3. No match - flush the buffer; dispatch the first pending key individually.
-//! - Timeout: If `sequence_timeout_ms` elapses after the last key, the pending buffer is flushed as individual keys (each evaluated independently).
+//! - Timeout: If `sequence_timeout_ms` elapses after the last key in Normal mode, the pending buffer is flushed as individual keys (each evaluated independently).
+//! - Command mode: Keys are accumulated in a command buffer for processing and execution. Mappings are:
+//!   1. Printable keys -> CommandInput(c)
+//!   2. Backspace -> CommandBackspace
+//!   3. Enter -> ExecuteCommand
+//!   4. Esc -> ExitInsert (used to exit Command mode)
 
 use std::time::{Duration, Instant};
 
@@ -32,7 +37,6 @@ pub enum EditorAction {
     ExitInsert,
 
     /// Normal -> Command (`:` prompt)
-    //* Implemented in Chunk 2.3.
     EnterCommand,
 
     // Normal-mode motions
@@ -62,6 +66,17 @@ pub enum EditorAction {
     /// A key that should be forwarded verbatim to `tui-textarea::TextArea::input`.
     TextInput(Input),
 
+    // Command-mode actions
+    /// Append a printable character to `App::command_input`
+    CommandInput(char),
+
+    /// Remove the last character from `App::command_input` (Backspace in Command mode)
+    CommandBackspace,
+
+    /// Execute the current contents of `App::command_input`
+    ExecuteCommand,
+
+    // Catch all
     /// A key that has no bound action in the current mode. Silently ignored.
     Unbound,
 }
@@ -81,7 +96,7 @@ struct Binding {
 /// A simplified key representation for Normal-mode matching.
 /// We only need to distinguish a small set of keys in Normal-mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum NormalKey {
+pub(crate) enum NormalKey {
     Char(char),
     Left,
     Right,
@@ -199,7 +214,7 @@ fn default_normal_bindings() -> Vec<Binding> {
             action: MoveLineStart,
         },
         Binding {
-            keys: vec![Char('9')],
+            keys: vec![Char('1')],
             action: MoveLineEnd,
         },
         // Two-key sequences
@@ -213,14 +228,6 @@ fn default_normal_bindings() -> Vec<Binding> {
         },
         // Editing
         Binding {
-            keys: vec![Char('x')],
-            action: DeleteCharForward,
-        },
-        Binding {
-            keys: vec![Char('X')],
-            action: DeleteCharBackward,
-        },
-        Binding {
             keys: vec![Backspace],
             action: DeleteCharBackward,
         },
@@ -228,6 +235,7 @@ fn default_normal_bindings() -> Vec<Binding> {
             keys: vec![Delete],
             action: DeleteCharForward,
         },
+        // App-level actions
         Binding {
             keys: vec![CtrlS],
             action: Save,
@@ -274,10 +282,10 @@ fn to_normal_key(key: &KeyEvent) -> Option<NormalKey> {
 /// Call `dispatch` for every key event from the crossterm event loop.
 pub struct KeymapDispatcher {
     /// Keys accumulated while waiting to resolve a multi-key sequence.
-    pending: Vec<NormalKey>,
+    pub(crate) pending: Vec<NormalKey>,
 
     /// When the first key of the current pending sequence was pressed.
-    last_key_at: Option<Instant>,
+    pub(crate) last_key_at: Option<Instant>,
 
     /// How long to wait for a completing key before flushing the pending buffer.
     sequence_timeout: Duration,
@@ -329,12 +337,13 @@ impl KeymapDispatcher {
         match mode {
             EditorMode::Insert => self.dispatch_insert(key),
             EditorMode::Normal => self.dispatch_normal(key),
+            EditorMode::Command => self.dispatch_command(key),
             //* Other modes are stubs; treat like Normal for now
             _ => self.dispatch_normal(key),
         }
     }
 
-    // Insert mode dispatch
+    /// Insert mode dispatch
     fn dispatch_insert(&self, key: KeyEvent) -> Option<EditorAction> {
         if key.code == KeyCode::Esc {
             return Some(EditorAction::ExitInsert);
@@ -343,7 +352,7 @@ impl KeymapDispatcher {
         Some(EditorAction::TextInput(Input::from(key)))
     }
 
-    // Normal mode dispatch
+    /// Normal mode dispatch
     fn dispatch_normal(&mut self, key: KeyEvent) -> Option<EditorAction> {
         let nk = match to_normal_key(&key) {
             Some(k) => k,
@@ -357,8 +366,19 @@ impl KeymapDispatcher {
 
         self.pending.push(nk);
         self.last_key_at = Some(Instant::now());
-
         self.evaluate_pending()
+    }
+
+    /// Command mode dispatch
+    fn dispatch_command(&self, key: KeyEvent) -> Option<EditorAction> {
+        match key.code {
+            KeyCode::Esc => Some(EditorAction::ExitInsert),
+            KeyCode::Enter => Some(EditorAction::ExecuteCommand),
+            KeyCode::Backspace => Some(EditorAction::CommandBackspace),
+            KeyCode::Char(c) => Some(EditorAction::CommandInput(c)),
+            // All other keys (arrows, function keys, etc.) are ignored in Command mode.
+            _ => Some(EditorAction::Unbound),
+        }
     }
 
     /// Try to match the curent pending buffer against the binding table.
@@ -443,6 +463,16 @@ mod tests {
     }
 
     #[test]
+    fn normal_colon_enters_command() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char(':')), &EditorMode::Normal),
+            Some(EditorAction::EnterCommand)
+        ));
+    }
+
+    #[test]
     fn normal_hjkl_move_cursor() {
         let mut d = dispatcher();
 
@@ -487,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_g_alone_returns_none_pending() {
+    fn normal_g_alone_is_buffered() {
         let mut d = dispatcher();
         // Single `g` is a prefix for `g g` — should be buffered, not dispatched.
         let action = d.dispatch(key(KeyCode::Char('g')), &EditorMode::Normal);
@@ -592,6 +622,61 @@ mod tests {
             Some(EditorAction::TextInput(_))
         ));
         assert!(d.pending.is_empty());
+    }
+
+    // Command mode
+
+    #[test]
+    fn command_printable_produces_command_input() {
+        let mut d = dispatcher();
+
+        assert!(
+            matches!(
+                d.dispatch(key(KeyCode::Char('w')), &EditorMode::Command),
+                Some(EditorAction::CommandInput('w'))
+            ),
+            "printable key in Command mode should be CommandInput"
+        );
+    }
+
+    #[test]
+    fn command_enter_produces_execute_command() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Enter), &EditorMode::Command),
+            Some(EditorAction::ExecuteCommand)
+        ));
+    }
+
+    #[test]
+    fn command_backspace_produces_command_backspace() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Backspace), &EditorMode::Command),
+            Some(EditorAction::CommandBackspace)
+        ));
+    }
+
+    #[test]
+    fn command_esc_produces_exit_insert() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Esc), &EditorMode::Command),
+            Some(EditorAction::ExitInsert)
+        ));
+    }
+
+    #[test]
+    fn command_space_is_command_input() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char(' ')), &EditorMode::Command),
+            Some(EditorAction::CommandInput(' '))
+        ));
     }
 
     // Timeout

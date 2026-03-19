@@ -1,15 +1,22 @@
-#[macro_use(defer_on_unwind)]
-extern crate scopeguard;
+//! Terminal markdown editor entry point.
+//!
+//! Responsibilities:
+//! - Parse CLI args
+//! - Load user config
+//! - Open the initial document (or create an empty one)
+//! - Set up the terminal (raw mode, alternate screen, panic hook)
+//! - Run the event loop
+//! - Restore the terminal on exit (clean path AND panic path)
+
+// #[macro_use(defer_on_unwind)]
+// extern crate scopeguard;
 
 mod app;
-mod app_state;
 mod cli;
 mod keymap;
 mod ui;
 
-use std::io;
-use std::process;
-use std::time::Duration;
+use std::{io, time::Duration};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -18,7 +25,6 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use tracing::info;
 
 use alloy_core::{config::Config, document::Document};
 use app::App;
@@ -37,81 +43,67 @@ fn restore_terminal() {
 
 // Entry point
 
-fn main() {
-    // 1. Logging - initialise before anything else so boot messages are captured.
-    //    Controlled via RUST_LOG env var.
+fn main() -> Result<()> {
+    // Logging - initialise before anything else so boot messages are captured.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        // Log to stderr so it does not interfere with the alternate screen.
         .with_writer(io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::WARN.into()),
+        )
         .init();
 
-    // 2. Panic hook - must be installed before raw mode is entered.
-    std::panic::set_hook(Box::new(|info| {
-        restore_terminal();
-        eprintln!("\nalloy panicked: {info}");
-    }));
-
-    if let Err(err) = run() {
-        restore_terminal();
-        eprintln!("error: {err:#}");
-        process::exit(1);
-    }
-}
-
-fn run() -> Result<()> {
-    // CLI args
+    // CLI + Config - parse CLI args and generate config
     let args = CliArgs::parse();
+    let config = Config::load().unwrap_or_else(|e| {
+        tracing::warn!("Config load failed: ({e:#}); using defaults");
+        Config::default()
+    });
 
-    // Config loading
-    let config = Config::load().context("failed to load configuration")?;
-
-    info!(engine = ?config.markdown.engine, "config loaded");
-
-    // Document loading
+    // Open initial document
     let document = match &args.file {
         Some(path) => {
-            if !path.exists() {
-                // Non-existent path: create a new empty document associated with that path.
-                // The file will be created on first save.
-                info!(path = %path.display(), "file not found; starting empty buffer");
-                let mut doc = Document::new();
-                doc.path = Some(path.clone());
-                doc
-            } else {
-                Document::open(path)
-                    .with_context(|| format!("failed to open '{}'", path.display()))?
-            }
+            Document::open(path).with_context(|| format!("failed to open '{}'", path.display()))?
         }
         None => Document::new(),
     };
 
-    // Application state
+    // Build app - initialize app state with config and opened document
     let mut app = App::new(config, document);
 
-    // Terminal setup
+    // Terminal setup - enable raw mode and enter alt screen
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stderr = io::stderr();
     execute!(stderr, EnterAlternateScreen).context("failed to enter alternate screen")?;
 
-    // Use a scopeguard so the terminal is always restored even if an error propagates out of the event loop.
-    defer_on_unwind! {
+    // Panic hook - must be installed before raw mode is entered.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
-    }
+        original_hook(info);
+    }));
 
     let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
 
-    // Event loop
+    // Event loop - start main event loop
+    let result = run_event_loop(&mut terminal, &mut app);
+
+    // Clean exit - restore terminal before returning
+    restore_terminal();
+    result
+}
+
+fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &mut App,
+) -> Result<()> {
     while !app.should_quit {
-        // 1. Drain any timed-out pending sequences before rendering.
+        // 1. Drain any timed-out pending key sequences and expired notifications before rendering.
         app.tick().context("tick error")?;
 
         // 2. Render.
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        terminal.draw(|frame| ui::render(frame, app))?;
 
         // 3. Poll for the next event with a short timeout so tick() can fire even when no keys are pressed (needed for sequence timeout).
         // Adjust the 16ms timer as needed.
@@ -121,18 +113,11 @@ fn run() -> Result<()> {
                     // Ignore key-release and key-repeat events - only act on key-press.
                     if key.kind == KeyEventKind::Press {
                         if let Err(e) = app.handle_key(key) {
-                            // For now, log error and continue. Chunk 2.3 will surface errors in the notification queue.
+                            // Surface errors in the notification queue.
+                            app.notify_error(format!("{e:#}"));
                             tracing::error!("handle_key error: {e:#}");
                         }
                     }
-                    // match (key.code, key.modifiers) {
-                    //     // Quit on `q` (Normal mode placeholder) or Ctrl+c.
-                    //     (KeyCode::Char('q'), KeyModifiers::NONE)
-                    //     | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    //         state.should_quit = true;
-                    //     }
-                    //     _ => {}
-                    // }
                 }
                 Event::Resize(_, _) => {
                     // Ratatui redraws on the next frame automatically.
@@ -142,7 +127,5 @@ fn run() -> Result<()> {
         }
     }
 
-    // Clean exit
-    restore_terminal();
     Ok(())
 }
