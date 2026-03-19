@@ -22,3 +22,6 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 
 scopeguard = "1.2.0"
+
+[dev-dependencies]
+tempfile.workspace = true
