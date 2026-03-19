@@ -13,7 +13,7 @@ use ratatui::{
 
 use alloy_core::EditorMode;
 
-use crate::app::App;
+use crate::app::{App, NotificationLevel};
 
 // ------------------------------------------------------------------
 // Top-level render entry point
@@ -21,20 +21,32 @@ use crate::app::App;
 
 /// Render the full UI for one frame.
 ///
-/// Layout example (vertical split):
+/// Layout example (Normal/Insert modes):
 /// ┌──────────────────────────────┐
 /// │  editor body (tui-textarea)  │  ← Constraint::Min(1)
 /// ├──────────────────────────────┤
 /// │  status bar (1 line)         │  ← Constraint::Length(1)
 /// └──────────────────────────────┘
+///
+/// Layout example (Command mode):
+/// ┌──────────────────────────────┐
+/// │  editor body (tui-textarea)  │  ← Constraint::Min(1)
+/// ├──────────────────────────────┤
+/// │  :command_input_here_        │  ← Constraint::Length(1)  (replaces status bar)
+/// └──────────────────────────────┘
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    let [body_area, status_area] =
+    let [body_area, bottom_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
     render_editor(frame, app, body_area);
-    render_status(frame, app, status_area);
+
+    if app.mode == EditorMode::Command {
+        render_command_prompt(frame, app, bottom_area);
+    } else {
+        render_status(frame, app, bottom_area);
+    }
 }
 
 // ------------------------------------------------------------------
@@ -43,8 +55,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_editor(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // Style the block border differently per mode so the user gets a clear peripheral signal about which mode they're in.
-    let (border_color, border_style_modifier) = match app.mode {
+    let (border_color, border_modifier) = match app.mode {
         EditorMode::Insert => (Color::LightCyan, Modifier::BOLD),
+        EditorMode::Command => (Color::Magenta, Modifier::BOLD),
         //* NOTE: Adjust color settings for other modes or import from user config
         _ => (Color::DarkGray, Modifier::empty()),
     };
@@ -58,7 +71,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
         .border_style(
             Style::default()
                 .fg(border_color)
-                .add_modifier(border_style_modifier),
+                .add_modifier(border_modifier),
         )
         .title(Span::styled(
             format!(" {} ", app.status_filename()),
@@ -73,6 +86,28 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
 }
 
 // ------------------------------------------------------------------
+// Command prompt (replaces status bar in Command mode)
+// ------------------------------------------------------------------
+
+/// Render the single-line command prompt.
+///
+/// Format:
+/// `:wq_`
+fn render_command_prompt(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let prompt = Span::styled(
+        format!(":{}_", app.command_input),
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(30, 30, 30))
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let line = Line::from(vec![prompt]);
+    let widget = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    frame.render_widget(widget, area);
+}
+
+// ------------------------------------------------------------------
 // Status bar
 // ------------------------------------------------------------------
 
@@ -80,6 +115,8 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
 ///
 /// Format:
 /// INSERT   filename.md [+]   |   42:7   |   1,234 words
+///
+/// When a notification is active, the right-hand segment is replaced by the notification message, colored by severity.
 fn render_status(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let (mode_bg, mode_fg) = mode_colors(&app.mode);
 
@@ -101,11 +138,24 @@ fn render_status(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
     let (row, col) = app.cursor_position();
     let pos_span = Span::styled(format!(" {row}:{col}"), Style::default().fg(Color::Yellow));
 
-    let words = word_count(app.textarea.lines());
-    let word_span = Span::styled(
-        format!(" {words} words"),
-        Style::default().fg(Color::DarkGray),
-    );
+    // Right-hand segment: notification or word count.
+    let right_span = if let Some(notif) = app.active_notification() {
+        let color = match notif.level {
+            NotificationLevel::Info => Color::Green,
+            NotificationLevel::Warn => Color::Yellow,
+            NotificationLevel::Error => Color::Red,
+        };
+        Span::styled(
+            format!(" {} ", notif.message),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        let words = word_count(app.textarea.lines());
+        Span::styled(
+            format!(" {words} words"),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
 
     let line = Line::from(vec![
         mode_span,
@@ -113,12 +163,12 @@ fn render_status(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
         sep.clone(),
         pos_span,
         sep,
-        word_span,
+        right_span,
     ]);
 
-    let status_bar = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    let widget = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
 
-    frame.render_widget(status_bar, area);
+    frame.render_widget(widget, area);
 }
 
 // ------------------------------------------------------------------
@@ -185,5 +235,10 @@ mod tests {
 
         // word_count should return 2 words, disregarding leading or trailing whitespace
         assert_eq!(word_count(&lines), 2);
+    }
+
+    #[test]
+    fn word_count_whitespace_only() {
+        assert_eq!(word_count(&["   ", "\t\t"]), 0);
     }
 }
