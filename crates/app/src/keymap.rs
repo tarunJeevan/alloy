@@ -58,6 +58,17 @@ pub enum EditorAction {
     /// Delete the character after the cursor (equivalent to Delete)
     DeleteCharForward,
 
+    // Preview controls
+    /// Scroll the preview pane down by a fixed number of lines
+    PreviewScrollDown,
+
+    /// Scroll the preview pane up by a fixed number of lines
+    PreviewScrollUp,
+
+    /// Cycle the preview mode (Rendered -> Hidden -> Rendered)
+    /// TODO: Html added in Chunk 4.1
+    TogglePreview,
+
     // Normal-mode app-level actions
     Save,
     Quit,
@@ -104,6 +115,8 @@ pub(crate) enum NormalKey {
     Down,
     CtrlS,
     CtrlW,
+    CtrlF,
+    CtrlB,
     Colon,
     Backspace,
     Delete,
@@ -126,6 +139,9 @@ enum NormalAction {
     MoveDocStart,
     DeleteCharBackward,
     DeleteCharForward,
+    PreviewScrollDown,
+    PreviewScrollUp,
+    TogglePreview,
     Save,
     Quit,
 }
@@ -147,6 +163,9 @@ impl From<NormalAction> for EditorAction {
             NormalAction::MoveDocStart => EditorAction::MoveDocStart,
             NormalAction::DeleteCharBackward => EditorAction::DeleteCharBackward,
             NormalAction::DeleteCharForward => EditorAction::DeleteCharForward,
+            NormalAction::PreviewScrollDown => EditorAction::PreviewScrollDown,
+            NormalAction::PreviewScrollUp => EditorAction::PreviewScrollUp,
+            NormalAction::TogglePreview => EditorAction::TogglePreview,
             NormalAction::Save => EditorAction::Save,
             NormalAction::Quit => EditorAction::Quit,
         }
@@ -226,6 +245,19 @@ fn default_normal_bindings() -> Vec<Binding> {
             keys: vec![Char('g'), Char('e')],
             action: MoveDocEnd,
         },
+        // Preview
+        Binding {
+            keys: vec![CtrlF],
+            action: PreviewScrollDown,
+        },
+        Binding {
+            keys: vec![CtrlB],
+            action: PreviewScrollUp,
+        },
+        Binding {
+            keys: vec![Char('t'), Char('p')],
+            action: TogglePreview,
+        },
         // Editing
         Binding {
             keys: vec![Backspace],
@@ -256,6 +288,8 @@ fn to_normal_key(key: &KeyEvent) -> Option<NormalKey> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlS),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlW),
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlF),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlB),
         (KeyCode::Char(':'), KeyModifiers::NONE) | (KeyCode::Char(':'), KeyModifiers::SHIFT) => {
             Some(NormalKey::Colon)
         }
@@ -565,6 +599,59 @@ mod tests {
             "g e should produce MoveDocEnd"
         );
         assert!(d.pending.is_empty());
+    }
+
+    // Preview control tests
+
+    #[test]
+    fn ctrl_f_scrolls_preview_down() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(
+                key_mod(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                &EditorMode::Normal,
+            ),
+            Some(EditorAction::PreviewScrollDown)
+        ));
+    }
+
+    #[test]
+    fn ctrl_b_scrolls_preview_down() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(
+                key_mod(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                &EditorMode::Normal,
+            ),
+            Some(EditorAction::PreviewScrollUp)
+        ));
+    }
+
+    #[test]
+    fn t_alone_is_buffered() {
+        let mut d = dispatcher();
+        let action = d.dispatch(key(KeyCode::Char('t')), &EditorMode::Normal);
+
+        assert!(
+            action.is_none(),
+            "'t' alone should be buffered (prefix of `t p`"
+        );
+    }
+
+    #[test]
+    fn tp_toggles_preview() {
+        let mut d = dispatcher();
+
+        assert!(
+            d.dispatch(key(KeyCode::Char('t')), &EditorMode::Normal)
+                .is_none()
+        );
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('p')), &EditorMode::Normal),
+            Some(EditorAction::TogglePreview)
+        ));
     }
 
     #[test]
