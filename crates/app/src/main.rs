@@ -14,6 +14,7 @@
 mod app;
 mod cli;
 mod keymap;
+mod preview_worker;
 mod ui;
 
 use std::{io, time::Duration};
@@ -99,7 +100,7 @@ fn run_event_loop(
     app: &mut App,
 ) -> Result<()> {
     while !app.should_quit {
-        // 1. Drain any timed-out pending key sequences and expired notifications before rendering.
+        // 1. Drain timed-out key sequences, expired notifications, and preview results.
         app.tick().context("tick error")?;
 
         // 2. Render.
@@ -121,6 +122,7 @@ fn run_event_loop(
                 }
                 Event::Resize(_, _) => {
                     // Ratatui redraws on the next frame automatically.
+                    // NOTE: col_width will be properly threaded in Chunk 3.2 when we pass the actual frame dimensions into `send_render_request()`.
                 }
                 _ => {}
             }
