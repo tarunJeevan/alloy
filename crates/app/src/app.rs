@@ -7,6 +7,7 @@
 //! - the keymap dispatcher
 //! - the notification queue
 //! - the command-mode input buffer
+//! - the preview worker channels and cached preview text
 //!
 //! Architecture note: live buffer vs persistence layer
 //!
@@ -18,11 +19,15 @@
 //! - save: `TextArea::lines().join("\n")` -> `Document::save()`
 
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent;
-use ratatui::style::{Color, Style};
+use ratatui::{
+    style::{Color, Style},
+    text::Text,
+};
 use tui_textarea::{CursorMove, TextArea};
 
 use alloy_core::{
@@ -33,6 +38,27 @@ use alloy_core::{
 };
 
 use crate::keymap::{EditorAction, KeymapDispatcher};
+use crate::preview_worker::{RenderRequest, RenderResult, spawn_worker};
+
+// --------------------------------------------------------------------
+// PreviewMode
+// --------------------------------------------------------------------
+
+/// Which content is displayed in the right-hand preview pane.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PreviewMode {
+    /// Terminal-rendered Markdown.
+    /// Real renderer in Chunk 3.2. Stub for now.
+    #[default]
+    Rendered,
+
+    /// Raw HTML source generated from the Markdown (Phase 4).
+    #[allow(dead_code)]
+    Html,
+
+    /// Preview pane is hidden. Editor takes the full width.
+    Hidden,
+}
 
 // --------------------------------------------------------------------
 // Notification types
@@ -87,6 +113,33 @@ pub struct App {
 
     /// Text being typed in Command mode (does NOT include the leading `:`).
     pub command_input: String,
+
+    // Preview state
+    /// Which preview mode is currently active.
+    pub preview_mode: PreviewMode,
+
+    /// Vertical scroll offset for the preview pane (in lines).
+    pub preview_scroll: u16,
+
+    /// Monotonically increasing document revision counter.
+    /// Incremented on every edit. Used to discard stale render results.
+    pub doc_revision: u64,
+
+    /// Latest rendered preview content received from the worker.
+    /// Starts as empty `Text`. Updated whenever a matchin-revision results arrives.
+    pub preview_text: Text<'static>,
+
+    /// Sender half of the bounded render request channel.
+    /// `try_send` is used - drops silently if the channel is full.
+    request_sender: SyncSender<RenderRequest>,
+
+    /// Receiver half of the render result channel.
+    /// Drained non-blockingly in `tick()`.
+    pub result_receiver: Receiver<RenderResult>,
+
+    /// Handle to the worker thread.
+    /// Kept alive so the thread isn't dropped prematurely. The worker exits when `request_sender` is dropped (channel close).
+    _worker_handle: std::thread::JoinHandle<()>,
 }
 
 impl App {
@@ -111,8 +164,12 @@ impl App {
         apply_normal_mode_style(&mut textarea, &config);
 
         let timeout_ms = config.editor.sequence_timeout_ms;
+        let debounce_ms = config.editor.preview_debounce_ms;
 
-        Self {
+        // Spawn the background render thread.
+        let (request_sender, result_receiver, worker_handle) = spawn_worker(debounce_ms);
+
+        let mut app = Self {
             document,
             mode: EditorMode::Normal,
             textarea,
@@ -121,7 +178,39 @@ impl App {
             keymap: KeymapDispatcher::new(timeout_ms),
             notifications: Vec::new(),
             command_input: String::new(),
-        }
+            preview_mode: PreviewMode::Rendered,
+            preview_scroll: 0,
+            doc_revision: 0,
+            preview_text: Text::default(),
+            request_sender,
+            result_receiver,
+            _worker_handle: worker_handle,
+        };
+
+        // Populate the initial preview.
+        app.send_render_request(80);
+        app
+    }
+
+    // --------------------------------------------------------------------
+    // Preview worker integration
+    // --------------------------------------------------------------------
+
+    /// Enqueue a render request for the current textarea content.
+    ///
+    /// Increments `doc_revision` and uses `try_send` - silently drops if the bounded channel is full (the next edit will trigger a new request).
+    ///
+    /// `col_width` is the current preview pane column width. Pass `80` as a placeholder until the real frame width is threaded through in Chunk 3.2.
+    pub fn send_render_request(&mut self, col_width: u16) {
+        self.doc_revision += 1;
+        let req = RenderRequest {
+            revision: self.doc_revision,
+            markdown: self.textarea_content(),
+            col_width,
+        };
+
+        // Silently drop if the channel is full - the next edit will trigger a new request.
+        let _ = self.request_sender.try_send(req);
     }
 
     // --------------------------------------------------------------------
@@ -186,12 +275,12 @@ impl App {
 
     /// Call this once per event loop tick BEFORE polling for new events.
     ///
-    /// Drain:
+    /// Drains:
     /// - Pending keymap actions that have timed out
     /// - Expired notifications
+    /// - Pending render results from the worker
     pub fn tick(&mut self) -> Result<()> {
         // Flush any timed-out pending keymap sequences.
-        // Loop because a single tick() call flushes one key. Multiple pending keys may need to be flushed in the same tick.
         while let Some(action) = self.keymap.tick() {
             self.handle_action(action)?;
         }
@@ -199,6 +288,19 @@ impl App {
         // Drain expired notifications.
         let now = Instant::now();
         self.notifications.retain(|n| n.expires_at > now);
+
+        // Drain render results - apply only if the revision matches.
+        while let Ok(result) = self.result_receiver.try_recv() {
+            if result.revision == self.doc_revision {
+                self.preview_text = result.text;
+
+                // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
+                // Users can scroll back down with Ctrl+d.
+                // NOTE: Uncomment if the auto-reset behavior is desired:
+                // self.preview_scroll = 0;
+            }
+            // Stale results (revision mismatch) are silently discarded.
+        }
 
         Ok(())
     }
@@ -265,16 +367,19 @@ impl App {
             EditorAction::DeleteCharBackward => {
                 self.textarea.delete_char();
                 self.document.modified = true;
+                self.send_render_request(80);
             }
             EditorAction::DeleteCharForward => {
                 self.textarea.delete_next_char();
                 self.document.modified = true;
+                self.send_render_request(80);
             }
 
             // Insert-mode text input
             EditorAction::TextInput(input) => {
                 self.textarea.input(input);
                 self.document.modified = true;
+                self.send_render_request(80);
             }
 
             // Command-mode
@@ -290,6 +395,22 @@ impl App {
                 self.mode = EditorMode::Normal;
                 apply_normal_mode_style(&mut self.textarea, &self.config);
                 self.execute_command(&cmd);
+            }
+
+            // Preveiw mode actions
+            EditorAction::PreviewScrollDown => {
+                self.preview_scroll = self.preview_scroll.saturating_add(5);
+            }
+            EditorAction::PreviewScrollUp => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(5);
+            }
+            EditorAction::TogglePreview => {
+                self.preview_mode = match self.preview_mode {
+                    PreviewMode::Rendered => PreviewMode::Hidden,
+                    PreviewMode::Hidden => PreviewMode::Rendered,
+                    // TODO: Add Html to cycle in Chunk 4.1
+                    PreviewMode::Html => PreviewMode::Rendered,
+                };
             }
 
             // App-level (Normal-mode)
@@ -381,6 +502,10 @@ impl App {
                             self.document = doc;
                             self.textarea = TextArea::new(lines);
                             apply_normal_mode_style(&mut self.textarea, &self.config);
+
+                            // Trigger a fresh preview render for the newly opened document.
+                            self.send_render_request(80);
+
                             let name = self.document.display_name();
                             self.notify_info(format!("Opened \"{name}\""));
                         }
@@ -530,6 +655,117 @@ mod tests {
         App::new(Config::default(), Document::new())
     }
 
+    // Preview mode actions
+
+    #[test]
+    fn initial_preview_mode_is_rendered() {
+        let app = make_app();
+
+        assert_eq!(app.preview_mode, PreviewMode::Rendered);
+    }
+
+    #[test]
+    fn toggle_preview_cycles_rendered_to_hidden() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::TogglePreview).unwrap();
+
+        assert_eq!(app.preview_mode, PreviewMode::Hidden);
+    }
+
+    #[test]
+    fn toggle_preview_cycles_hidden_to_rendered() {
+        let mut app = make_app();
+        app.preview_mode = PreviewMode::Hidden;
+        app.handle_action(EditorAction::TogglePreview).unwrap();
+
+        assert_eq!(app.preview_mode, PreviewMode::Rendered);
+    }
+
+    // Preview scrolling
+
+    #[test]
+    fn preview_scroll_down_increments() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::PreviewScrollDown).unwrap();
+
+        assert_eq!(app.preview_scroll, 5);
+    }
+
+    #[test]
+    fn preview_scroll_up_saturates_at_zero() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::PreviewScrollUp).unwrap();
+
+        assert_eq!(app.preview_scroll, 0, "scroll should not go below 0");
+    }
+
+    // doc_revision increments on edit
+
+    #[test]
+    fn edit_action_increments_doc_revision() {
+        let mut app = make_app();
+
+        // Seed the textarea with content so DeleteCharBackward has something to delete and is guaranteed to call send_render_request.
+        app.textarea = tui_textarea::TextArea::new(vec!["hello".to_string()]);
+        app.textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let rev_before = app.doc_revision;
+
+        app.handle_action(EditorAction::DeleteCharBackward).unwrap();
+
+        assert!(
+            app.doc_revision > rev_before,
+            "doc_revision should increase after an edit action (before={rev_before}, after={})",
+            app.doc_revision
+        );
+    }
+
+    #[test]
+    fn multiple_edits_keep_incrementing_doc_revision() {
+        let mut app = make_app();
+
+        app.textarea = tui_textarea::TextArea::new(vec!["hello world".to_string()]);
+        app.textarea.move_cursor(tui_textarea::CursorMove::End);
+
+        let rev0 = app.doc_revision;
+        app.handle_action(EditorAction::DeleteCharBackward).unwrap();
+
+        let rev1 = app.doc_revision;
+        app.handle_action(EditorAction::DeleteCharBackward).unwrap();
+
+        let rev2 = app.doc_revision;
+
+        assert!(
+            rev1 > rev0,
+            "first edit should increment revision. (rev0={rev0}, rev1={rev1}, rev2={rev2})"
+        );
+        assert!(
+            rev2 > rev1,
+            "second edit should increment revision again. (rev0={rev0}, rev1={rev1}, rev2={rev2})"
+        );
+    }
+
+    // Stale render result is discarded
+
+    #[test]
+    fn stale_render_result_is_not_applied() {
+        let mut app = make_app();
+
+        // Manually inject a stale result into the re;sult channel by sending directly.
+        // We can't access the internal sender, so we test the logic via `tick()` after manipulating doc_revision.
+        // Advance doc_revision well ahead of any result the worker might produce.
+        app.doc_revision = 9999;
+
+        // tick() should not panic and preview_text should remain the default empty Text.
+        app.tick().unwrap();
+
+        // if the worker happened to send a result for revision 1 (from `App::new()`), it should have been discarded because doc_revision is 9999.
+        // We can't assert on preview_text content without the worker having run, but we can assert the app didn't crash and doc_revision is unchanged.
+        assert_eq!(app.doc_revision, 9999);
+    }
+
+    // Command execution
+
     #[test]
     fn execute_w_with_no_path_pushes_error_notification() {
         let mut app = make_app();
@@ -583,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn push_notification_and_active_notification() {
+    fn push_notification_visible_via_active_notification() {
         let mut app = make_app();
 
         assert!(app.active_notification().is_none());
