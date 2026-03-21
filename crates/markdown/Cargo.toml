@@ -1,9 +1,16 @@
 [package]
-name    = "markdown"
+name = "markdown"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow.workspace   = true
+anyhow.workspace = true
+ratatui.workspace = true
 thiserror.workspace = true
-tracing.workspace  = true
+tracing.workspace = true
+
+pulldown-cmark = { version = "0.13.1", default-features = false }
+
+[dev-dependencies]
+insta = { version = "1.46.3", features = ["filters"] }
+tempfile.workspace = true

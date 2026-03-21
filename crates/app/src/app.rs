@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent;
+use markdown::engines::pulldown::EngineExtensions;
 use ratatui::{
     style::{Color, Style},
     text::Text,
@@ -129,6 +130,13 @@ pub struct App {
     /// Starts as empty `Text`. Updated whenever a matchin-revision results arrives.
     pub preview_text: Text<'static>,
 
+    /// Cached preview pane column width from the last rendered frmae.
+    ///
+    /// Set by `ui::render()` after `split_body()` computes the preview rect.
+    /// Passed to `send_render_request` so the renderer knows the wrapping width.
+    /// Defaults to 80 until the first frame is drawn.
+    pub last_preview_width: u16,
+
     /// Sender half of the bounded render request channel.
     /// `try_send` is used - drops silently if the channel is full.
     request_sender: SyncSender<RenderRequest>,
@@ -150,7 +158,6 @@ impl App {
         let content = document.content();
 
         // `TextArea::new()` accepts `Vec<String>` lines. Split on '\n'.
-        // DO NOT include the trailing empty string that `str::lines()` would omit but a trailing '\n' produces with `split`.
         let lines: Vec<String> = if content.is_empty() {
             vec![String::new()]
         } else {
@@ -166,8 +173,16 @@ impl App {
         let timeout_ms = config.editor.sequence_timeout_ms;
         let debounce_ms = config.editor.preview_debounce_ms;
 
+        // Convert config extension flags into the engine's own type.
+        // The `markdown` crate is decoupled from `alloy-core` intentionally - we copy the booleans rather than passing the entire ExtensionConfig.
+        let extensions = EngineExtensions {
+            gfm: config.markdown.extensions.gfm,
+            footnotes: false, // NOTE: Not in config yet. Add when footnote support is implemented.
+        };
+
         // Spawn the background render thread.
-        let (request_sender, result_receiver, worker_handle) = spawn_worker(debounce_ms);
+        let (request_sender, result_receiver, worker_handle) =
+            spawn_worker(debounce_ms, extensions);
 
         let mut app = Self {
             document,
@@ -182,13 +197,14 @@ impl App {
             preview_scroll: 0,
             doc_revision: 0,
             preview_text: Text::default(),
+            last_preview_width: 80,
             request_sender,
             result_receiver,
             _worker_handle: worker_handle,
         };
 
         // Populate the initial preview.
-        app.send_render_request(80);
+        app.send_render_request();
         app
     }
 
@@ -201,12 +217,12 @@ impl App {
     /// Increments `doc_revision` and uses `try_send` - silently drops if the bounded channel is full (the next edit will trigger a new request).
     ///
     /// `col_width` is the current preview pane column width. Pass `80` as a placeholder until the real frame width is threaded through in Chunk 3.2.
-    pub fn send_render_request(&mut self, col_width: u16) {
+    pub fn send_render_request(&mut self) {
         self.doc_revision += 1;
         let req = RenderRequest {
             revision: self.doc_revision,
             markdown: self.textarea_content(),
-            col_width,
+            col_width: self.last_preview_width,
         };
 
         // Silently drop if the channel is full - the next edit will trigger a new request.
@@ -367,19 +383,19 @@ impl App {
             EditorAction::DeleteCharBackward => {
                 self.textarea.delete_char();
                 self.document.modified = true;
-                self.send_render_request(80);
+                self.send_render_request();
             }
             EditorAction::DeleteCharForward => {
                 self.textarea.delete_next_char();
                 self.document.modified = true;
-                self.send_render_request(80);
+                self.send_render_request();
             }
 
             // Insert-mode text input
             EditorAction::TextInput(input) => {
                 self.textarea.input(input);
                 self.document.modified = true;
-                self.send_render_request(80);
+                self.send_render_request();
             }
 
             // Command-mode
@@ -504,7 +520,7 @@ impl App {
                             apply_normal_mode_style(&mut self.textarea, &self.config);
 
                             // Trigger a fresh preview render for the newly opened document.
-                            self.send_render_request(80);
+                            self.send_render_request();
 
                             let name = self.document.display_name();
                             self.notify_info(format!("Opened \"{name}\""));
@@ -697,6 +713,13 @@ mod tests {
         app.handle_action(EditorAction::PreviewScrollUp).unwrap();
 
         assert_eq!(app.preview_scroll, 0, "scroll should not go below 0");
+    }
+
+    #[test]
+    fn last_preview_width_defaults_to_80() {
+        let app = make_app();
+
+        assert_eq!(app.last_preview_width, 80);
     }
 
     // doc_revision increments on edit

@@ -53,10 +53,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Horizontal: editor (left) + optional preview (right)
     let (editor_area, opt_preview_area) = split_body(app, body_area);
 
-    render_editor(frame, app, editor_area);
-
+    // The renderer needs the real inner width (sans borders) so it can hard-wrap lines before ratatui sees them. We update the field here before any render call that might queue a new render request.
     if let Some(preview_area) = opt_preview_area {
+        // Subtract 2 for left+right borders. Clamp to a min of 20.
+        app.last_preview_width = preview_area.width.saturating_sub(2).max(20);
+        render_editor(frame, app, editor_area);
         render_preview(frame, app, preview_area);
+    } else {
+        app.last_preview_width = 80; // Sensible fallback when preview is hidden
+        render_editor(frame, app, editor_area);
     }
 
     if app.mode == EditorMode::Command {
@@ -143,8 +148,6 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
         .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
 
     // Wrap::Word is intentionally NOT set here.
-    // NOTE: The Markdown renderer (Chunk 3.2) handles line-wrapping at render time so that styled spans are never broken mid-token.
-    // NOTE: The stub renderer produces plain lines that don't need wrapping.
     let widget = Paragraph::new(app.preview_text.clone())
         .block(block)
         .scroll((app.preview_scroll, 0));
@@ -332,8 +335,8 @@ mod tests {
         let app = App::new(Config::default(), Document::new());
 
         // Simulate a very narrow body rect
-        let naroow = Rect::new(0, 0, MIN_SPLIT_WIDTH - 1, 20);
-        let (_, preview) = split_body(&app, naroow);
+        let narrow = Rect::new(0, 0, MIN_SPLIT_WIDTH - 1, 20);
+        let (_, preview) = split_body(&app, narrow);
 
         assert!(
             preview.is_none(),
