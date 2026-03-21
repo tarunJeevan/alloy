@@ -14,13 +14,18 @@
 //!
 //! Channel sizing - The request channel is BOUNDED (`sync_channel(4)`). The UI uses `try_send` and silently drops if the channel is full. The next keystroke will trigger a fresh request anyway. This ensures the worker is never starved of CPU by a backlog of stale render jobs.
 
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, SyncSender, sync_channel},
+};
 use std::time::Duration;
 
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
+
+use markdown::{MarkdownEngine, PulldownEngine, engines::pulldown::EngineExtensions};
 
 // ---------------------------------------------------------
 // Public channel types
@@ -61,6 +66,7 @@ pub struct RenderResult {
 /// The `JoinHandle` can be stored on `App` or dropped - the worker exits cleanly when the `request_sender` is dropped (i.e. when `App` is dropped).
 pub fn spawn_worker(
     debounce_ms: u64,
+    extensions: EngineExtensions,
 ) -> (
     SyncSender<RenderRequest>,
     Receiver<RenderResult>,
@@ -73,10 +79,13 @@ pub fn spawn_worker(
     // Unbounded result channel - the worker sends at most one result per render cycle so there's no risk of backlog.
     let (res_tx, res_rx) = std::sync::mpsc::channel::<RenderResult>();
 
+    // The engine is shared with the worker thread via Arc.
+    let engine: Arc<dyn MarkdownEngine> = Arc::new(PulldownEngine::new(extensions));
+
     let handle = std::thread::Builder::new()
         .name("preview-worker".into())
         .spawn(move || {
-            worker_loop(req_rx, res_tx, Duration::from_millis(debounce_ms));
+            worker_loop(req_rx, res_tx, Duration::from_millis(debounce_ms), engine);
         })
         .expect("failed to spawn preview worker thread");
 
@@ -91,13 +100,14 @@ fn worker_loop(
     req_rx: Receiver<RenderRequest>,
     res_tx: std::sync::mpsc::Sender<RenderResult>,
     debounce: Duration,
+    engine: Arc<dyn MarkdownEngine>,
 ) {
     loop {
         // Block until the first request arrives (or the channel is closed, in which case exit).
         let first = match req_rx.recv() {
             Ok(r) => r,
             Err(_) => {
-                tracing::debug!("preview worker: request channel closed, exiting");
+                tracing::debug!("preview worker: request channel closed. Exiting...");
                 return;
             }
         };
@@ -105,9 +115,18 @@ fn worker_loop(
         // Drain loop - keep replacing `current` with newer requests until the debounce window expires with no new arrivals.
         let current = drain_to_latest(first, &req_rx, debounce);
 
-        // Render inside catch_unwind so a panic in the renderer doesn't kill the worker.
         let revision = current.revision;
-        let result = std::panic::catch_unwind(|| render_stub(&current));
+        let col_width = current.col_width;
+        let markdown = current.markdown.clone();
+
+        // A newtype wrapper to unconditionally implement UnwindSafe on MarkdownEngine to satisfy compiler requirements.
+        use std::panic::AssertUnwindSafe;
+
+        // Render inside catch_unwind so a panic in the renderer doesn't kill the worker.
+        // SAFETY: PulldownEngine holds only plain config flags (no interior mutability). AssertUnwindSafe is correct here. Revisit if a stateful engine is ever added.
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            engine.render_terminal(&markdown, col_width)
+        }));
 
         let text = match result {
             Ok(t) => t,
@@ -152,39 +171,8 @@ fn drain_to_latest(
 }
 
 // ---------------------------------------------------------
-// Stub renderer (Real renderer implemented in Chunk 3.2)
+// Error sentinel
 // ---------------------------------------------------------
-
-/// Placeholder renderer: converts the Markdown source to plain `Text` line-by-line.
-///
-/// This is intentionally minimal - it exists only to verify the channel plumbing works end-to-end before Chunk 3.2 replaces it with the real `pulldown-cmark` renderer.
-fn render_stub(req: &RenderRequest) -> Text<'static> {
-    let header = Line::from(vec![
-        Span::styled(
-            "[ Preview ]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ),
-        Span::styled(
-            "(stub - real renderer in Chunk 3.2)",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-
-    let separator = Line::from(Span::styled(
-        "-".repeat(req.col_width.max(1) as usize),
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    let mut lines = vec![header, separator];
-
-    for raw_line in req.markdown.lines() {
-        lines.push(Line::from(Span::raw(raw_line.to_owned())));
-    }
-
-    Text::from(lines)
-}
 
 /// Build a single-line error `Text` for use in the sentinel result after a renderer panic.
 fn error_text(msg: &str) -> Text<'static> {
@@ -203,10 +191,17 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    fn default_extensions() -> EngineExtensions {
+        EngineExtensions {
+            gfm: true,
+            footnotes: false,
+        }
+    }
+
     fn req(revision: u64) -> RenderRequest {
         RenderRequest {
             revision,
-            markdown: format!("# Revision {revision}"),
+            markdown: format!("# Revision {revision}\n\nSome content."),
             col_width: 80,
         }
     }
@@ -214,7 +209,7 @@ mod tests {
     /// Spawn a worker with a short debounce and verify it renders the latest revision.
     #[test]
     fn worker_renders_latest_revision() {
-        let (tx, rx, _handle) = spawn_worker(50);
+        let (tx, rx, _handle) = spawn_worker(50, default_extensions());
 
         // Send 5 rapid requests.
         for i in 1u64..=5 {
@@ -246,7 +241,7 @@ mod tests {
     /// This is enforced in App::tick(), but we verify revision tagging is correct here.
     #[test]
     fn result_carries_correct_revision() {
-        let (tx, rx, _handle) = spawn_worker(30);
+        let (tx, rx, _handle) = spawn_worker(30, default_extensions());
 
         tx.try_send(req(42)).unwrap();
         std::thread::sleep(Duration::from_millis(200));
@@ -255,11 +250,40 @@ mod tests {
         assert_eq!(result.revision, 42);
     }
 
+    #[test]
+    fn rendered_text_contains_heading_content() {
+        let (tx, rx, _handle) = spawn_worker(30, default_extensions());
+
+        tx.try_send(RenderRequest {
+            revision: 1,
+            markdown: "# Hello Alloy\n\nSome paragraph.\n".to_owned(),
+            col_width: 80,
+        })
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let result = rx.try_recv().expect("expected a result");
+
+        let plain: String = result
+            .text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+
+        assert!(
+            plain.contains("Hello Alloy"),
+            "rendered output should contain heading text: {plain:?}"
+        );
+    }
+
     /// Verify the debounce actually coalesces rapid requests - if we send N requests quickly, we should receive far fewer than N results (ideally 1).
     #[test]
     fn debounce_coalesces_rapid_requests() {
         let debounce_ms = 80u64;
-        let (tx, rx, _handle) = spawn_worker(debounce_ms);
+        let (tx, rx, _handle) = spawn_worker(debounce_ms, default_extensions());
 
         let n = 10u64;
         let t0 = Instant::now();
