@@ -1,0 +1,37 @@
+---
+source: crates/markdown/src/engines/comrak.rs
+expression: html
+---
+<h1>Lists</h1>
+<h2>Unordered</h2>
+<ul>
+<li>Alpha</li>
+<li>Beta</li>
+<li>Gamma
+<ul>
+<li>Nested item one</li>
+<li>Nested item two
+<ul>
+<li>Doubly nested</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h2>Ordered</h2>
+<ol>
+<li>First</li>
+<li>Second</li>
+<li>Third
+<ol>
+<li>Sub-first</li>
+<li>Sub-second</li>
+</ol>
+</li>
+</ol>
+<h2>Task list (GFM)</h2>
+<ul>
+<li><input type="checkbox" checked="" disabled="" /> Done item</li>
+<li><input type="checkbox" disabled="" /> Pending item</li>
+<li><input type="checkbox" checked="" disabled="" /> Another done item</li>
+</ul>
