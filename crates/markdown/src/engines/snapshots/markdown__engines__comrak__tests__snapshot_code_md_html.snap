@@ -1,0 +1,25 @@
+---
+source: crates/markdown/src/engines/comrak.rs
+expression: html
+---
+<h1>Code Blocks</h1>
+<h2>Fenced - Rust</h2>
+<pre><code class="language-rust">fn main() {
+  println!(&quot;Hello, alloy!&quot;);
+}
+</code></pre>
+<h2>Fenced - Python</h2>
+<pre><code class="language-python">def greet(name: str) -&gt; str:
+  return f&quot;Hello, {name}!&quot;
+</code></pre>
+<h2>Fenced - no language tag</h2>
+<pre><code>plain text code block
+with multiple lines
+</code></pre>
+<h2>Inline code</h2>
+<p>Use <code>cargo build --release</code> to compile. The function <code>render_terminal</code> is in the <code>markdown</code> crate.</p>
+<h2>Indented code block</h2>
+<pre><code>indented line one
+indented line two
+</code></pre>
+<hr />

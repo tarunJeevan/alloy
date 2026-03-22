@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
 };
 
@@ -18,9 +18,9 @@ use crate::app::{App, NotificationLevel, PreviewMode};
 /// Minimum total body width (columns) before the split is suppressed.
 const MIN_SPLIT_WIDTH: u16 = 40;
 
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Top-level render entry point
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Render the full UI for one frame.
 ///
@@ -71,10 +71,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Layout helpers
-// ------------------------------------------------------------------
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Compute the editor area and an optional preview area from the body rect.
 ///
@@ -96,8 +95,9 @@ fn split_body(app: &App, body: Rect) -> (Rect, Option<Rect>) {
     (left, Some(right))
 }
 
+// ---------------------------------------------------------------
 // Editor pane
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     // Style the block border differently per mode so the user gets a clear peripheral signal about which mode they're in.
@@ -131,23 +131,22 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(&app.textarea, area);
 }
 
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Preview pane
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, border_color) = match app.preview_mode {
-        PreviewMode::Rendered => (" Preview ", Color::DarkGray),
-        PreviewMode::Html => (" HTML ", Color::DarkGray),
+    match app.preview_mode {
+        PreviewMode::Rendered => render_preview_rendered(frame, app, area),
+        PreviewMode::Html => render_preview_html(frame, app, area),
         PreviewMode::Hidden => unreachable!("render_preview called with Hidden mode"),
-    };
+    }
+}
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+/// Render the terminal-rendered Markdown preview.
+fn render_preview_rendered(frame: &mut Frame, app: &App, area: Rect) {
+    let block = preview_block(" Preview ", Color::DarkGray);
 
-    // Wrap::Word is intentionally NOT set here.
     let widget = Paragraph::new(app.preview_text.clone())
         .block(block)
         .scroll((app.preview_scroll, 0));
@@ -155,9 +154,50 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
-// ------------------------------------------------------------------
+/// Render the raw HTML source preview.
+///
+/// NOTE: The HTML string is split on newlines, each line becomes an unstyled `Line`. A line cap of 2000 is enfored by `html_to_lines()` in the `markdown` crate before the result is stored on `App`.
+///
+/// Performs the conversion here at render time from `app.preview_html` (a String) because storing a pre-built `Text<'static>` for HTML would require an extra allocation in `App::tick()` on every render cycle even when the user is in Rendered mode.
+fn render_preview_html(frame: &mut Frame, app: &App, area: Rect) {
+    let block = preview_block(" HTML ", Color::DarkGray);
+
+    // Build `Text` from the stored HTML string - unstyled, plain lines.
+    let text = html_string_to_text(&app.preview_html);
+
+    let widget = Paragraph::new(text)
+        .block(block)
+        .scroll((app.preview_scroll_html, 0));
+
+    frame.render_widget(widget, area);
+}
+
+/// Build an unstyled `Text<'static>` from a raw HTML string.
+///
+/// NOTE: Each newline-delimited line becomes one `Line`. This is intentionally plain text - syntax highlighting the HTML source is deferred post-MVP (see Decision Log for more details).
+fn html_string_to_text(html: &str) -> Text<'static> {
+    use markdown::html_to_lines;
+
+    let lines = html_to_lines(html);
+    let ratatui_lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|l| Line::from(Span::raw(l)))
+        .collect();
+
+    Text::from(ratatui_lines)
+}
+
+/// Build a standard preview block with a given title and border color.
+fn preview_block(title: &'static str, border_color: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, Style::default().fg(Color::DarkGray)))
+}
+
+// ---------------------------------------------------------------
 // Command prompt (replaces status bar in Command mode)
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Render the single-line command prompt.
 ///
@@ -177,9 +217,9 @@ fn render_command_prompt(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Status bar
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Render the one-line status bar.
 ///
@@ -254,9 +294,9 @@ fn render_status(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
     frame.render_widget(widget, area);
 }
 
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Helpers
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Background and foreground colors for the mode indicator pill.
 fn mode_colors(mode: &EditorMode) -> (Color, Color) {
@@ -280,9 +320,9 @@ pub fn word_count(lines: &[impl AsRef<str>]) -> usize {
         .count()
 }
 
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Tests
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -323,6 +363,32 @@ mod tests {
     #[test]
     fn word_count_whitespace_only() {
         assert_eq!(word_count(&["   ", "\t\t"]), 0);
+    }
+
+    // html_string_to_text
+
+    #[test]
+    fn html_string_to_text_splits_on_newlines() {
+        let html = "<p>line 1</p>\n<p>line 2</p>";
+        let text = html_string_to_text(html);
+
+        assert_eq!(text.lines.len(), 2);
+        assert_eq!(text.lines[0].spans[0].content, "<p>line 1</p>");
+        assert_eq!(text.lines[1].spans[0].content, "<p>line 2</p>");
+    }
+
+    #[test]
+    fn html_string_to_text_empty_input() {
+        let text = html_string_to_text("");
+
+        // html_to_lines on empty string should produce 0 lines
+        assert!(
+            text.lines.is_empty()
+                || text
+                    .lines
+                    .iter()
+                    .all(|l| l.spans.is_empty() || l.spans[0].content.is_empty())
+        );
     }
 
     // split_body logic - tested via the Rect math directly
