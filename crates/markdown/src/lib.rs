@@ -16,4 +16,7 @@ pub mod engine;
 pub mod engines;
 
 pub use engine::MarkdownEngine;
-pub use engines::pulldown::PulldownEngine;
+pub use engines::{
+    comrak::{ComrakEngine, ComrakExtensions, html_to_lines},
+    pulldown::PulldownEngine,
+};

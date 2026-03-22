@@ -9,6 +9,7 @@ ratatui.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+comrak = { version = "0.51.0", default-features = false }
 pulldown-cmark = { version = "0.13.1", default-features = false }
 
 [dev-dependencies]
