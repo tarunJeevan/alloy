@@ -24,46 +24,38 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent;
-use markdown::engines::pulldown::EngineExtensions;
 use ratatui::{
     style::{Color, Style},
     text::Text,
 };
 use tui_textarea::{CursorMove, TextArea};
 
-use alloy_core::{
-    // errors::CoreError,
-    EditorMode,
-    config::Config,
-    document::Document,
-};
+use alloy_core::{EditorMode, config::Config, document::Document};
 
 use crate::keymap::{EditorAction, KeymapDispatcher};
-use crate::preview_worker::{RenderRequest, RenderResult, spawn_worker};
+use crate::preview_worker::{RenderRequest, RenderResult, WorkerExtensions, spawn_worker};
 
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 // PreviewMode
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Which content is displayed in the right-hand preview pane.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PreviewMode {
     /// Terminal-rendered Markdown.
-    /// Real renderer in Chunk 3.2. Stub for now.
     #[default]
     Rendered,
 
-    /// Raw HTML source generated from the Markdown (Phase 4).
-    #[allow(dead_code)]
+    /// Raw HTML source generated from the Markdown (via `ComrakEngine`).
     Html,
 
     /// Preview pane is hidden. Editor takes the full width.
     Hidden,
 }
 
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Notification types
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Severety level of a transient notification message
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,16 +111,21 @@ pub struct App {
     /// Which preview mode is currently active.
     pub preview_mode: PreviewMode,
 
-    /// Vertical scroll offset for the preview pane (in lines).
+    /// Vertical scroll offset for the `Rendered` preview pane (in lines).
     pub preview_scroll: u16,
+
+    /// Vertical scroll offset for the `Html` preview pane (in lines).
+    pub preview_scroll_html: u16,
 
     /// Monotonically increasing document revision counter.
     /// Incremented on every edit. Used to discard stale render results.
     pub doc_revision: u64,
 
-    /// Latest rendered preview content received from the worker.
-    /// Starts as empty `Text`. Updated whenever a matchin-revision results arrives.
+    /// Latest terminal-rendered preview content (`PreviewMode::Rendered`).
     pub preview_text: Text<'static>,
+
+    /// Latest HTML string (`PreviewMode::Html`).
+    pub preview_html: String,
 
     /// Cached preview pane column width from the last rendered frmae.
     ///
@@ -175,9 +172,12 @@ impl App {
 
         // Convert config extension flags into the engine's own type.
         // The `markdown` crate is decoupled from `alloy-core` intentionally - we copy the booleans rather than passing the entire ExtensionConfig.
-        let extensions = EngineExtensions {
+        let extensions = WorkerExtensions {
             gfm: config.markdown.extensions.gfm,
-            footnotes: false, // NOTE: Not in config yet. Add when footnote support is implemented.
+            wiki_links: config.markdown.extensions.wiki_links,
+            footnotes: false, // NOTE: Not in config yet.
+            frontmatter: config.markdown.extensions.frontmatter,
+            math: config.markdown.extensions.math,
         };
 
         // Spawn the background render thread.
@@ -195,8 +195,10 @@ impl App {
             command_input: String::new(),
             preview_mode: PreviewMode::Rendered,
             preview_scroll: 0,
+            preview_scroll_html: 0,
             doc_revision: 0,
             preview_text: Text::default(),
+            preview_html: String::new(),
             last_preview_width: 80,
             request_sender,
             result_receiver,
@@ -208,15 +210,13 @@ impl App {
         app
     }
 
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
     // Preview worker integration
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
 
     /// Enqueue a render request for the current textarea content.
     ///
     /// Increments `doc_revision` and uses `try_send` - silently drops if the bounded channel is full (the next edit will trigger a new request).
-    ///
-    /// `col_width` is the current preview pane column width. Pass `80` as a placeholder until the real frame width is threaded through in Chunk 3.2.
     pub fn send_render_request(&mut self) {
         self.doc_revision += 1;
         let req = RenderRequest {
@@ -229,9 +229,9 @@ impl App {
         let _ = self.request_sender.try_send(req);
     }
 
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
     // Notification queue
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
 
     /// Push a new transient notification into the queue.
     ///
@@ -272,9 +272,9 @@ impl App {
         self.notifications.iter().rev().find(|n| n.expires_at > now)
     }
 
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
     // Event handling
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
 
     /// Process a raw key event.
     ///
@@ -308,7 +308,8 @@ impl App {
         // Drain render results - apply only if the revision matches.
         while let Ok(result) = self.result_receiver.try_recv() {
             if result.revision == self.doc_revision {
-                self.preview_text = result.text;
+                self.preview_text = result.rendered;
+                self.preview_html = result.html;
 
                 // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
                 // Users can scroll back down with Ctrl+d.
@@ -414,18 +415,27 @@ impl App {
             }
 
             // Preveiw mode actions
-            EditorAction::PreviewScrollDown => {
-                self.preview_scroll = self.preview_scroll.saturating_add(5);
-            }
-            EditorAction::PreviewScrollUp => {
-                self.preview_scroll = self.preview_scroll.saturating_sub(5);
-            }
+            EditorAction::PreviewScrollDown => match self.preview_mode {
+                PreviewMode::Html => {
+                    self.preview_scroll_html = self.preview_scroll_html.saturating_add(5);
+                }
+                _ => {
+                    self.preview_scroll = self.preview_scroll.saturating_add(5);
+                }
+            },
+            EditorAction::PreviewScrollUp => match self.preview_mode {
+                PreviewMode::Html => {
+                    self.preview_scroll_html = self.preview_scroll_html.saturating_sub(5);
+                }
+                _ => {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(5);
+                }
+            },
             EditorAction::TogglePreview => {
                 self.preview_mode = match self.preview_mode {
-                    PreviewMode::Rendered => PreviewMode::Hidden,
+                    PreviewMode::Rendered => PreviewMode::Html,
+                    PreviewMode::Html => PreviewMode::Hidden,
                     PreviewMode::Hidden => PreviewMode::Rendered,
-                    // TODO: Add Html to cycle in Chunk 4.1
-                    PreviewMode::Html => PreviewMode::Rendered,
                 };
             }
 
@@ -451,9 +461,9 @@ impl App {
         Ok(())
     }
 
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
     // Command execution
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
 
     /// Parse and execute a command string (the text typed after `:`).
     ///
@@ -535,9 +545,9 @@ impl App {
         }
     }
 
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
     // Save
-    // --------------------------------------------------------------------
+    // -----------------------------------------------------------
 
     /// Flush the live textarea content to disk via `Document::save`.
     ///
@@ -552,7 +562,9 @@ impl App {
         Ok(())
     }
 
+    // -----------------------------------------------------------
     // Accessors
+    // -----------------------------------------------------------
 
     /// Extract the current live content from the textarea as a single `String`.
     ///
@@ -580,9 +592,9 @@ impl App {
     }
 }
 
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Command string parsing helper
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Split a command string into `(verb, optional argument)`.
 ///
@@ -601,9 +613,9 @@ fn split_command(cmd: &str) -> (&str, Option<&str>) {
     }
 }
 
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Mode-aware textarea styling helpers
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Apply Normal-mode styling to the textarea:
 /// - Block-style (thick) cursor
@@ -627,9 +639,9 @@ fn apply_insert_mode_style(textarea: &mut TextArea<'static>, _config: &Config) {
     textarea.set_block(Block::default());
 }
 
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Tests
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -681,8 +693,17 @@ mod tests {
     }
 
     #[test]
-    fn toggle_preview_cycles_rendered_to_hidden() {
+    fn toggle_preview_cycles_rendered_to_html() {
         let mut app = make_app();
+        app.handle_action(EditorAction::TogglePreview).unwrap();
+
+        assert_eq!(app.preview_mode, PreviewMode::Html);
+    }
+
+    #[test]
+    fn toggle_preview_cycles_html_to_hidden() {
+        let mut app = make_app();
+        app.preview_mode = PreviewMode::Html;
         app.handle_action(EditorAction::TogglePreview).unwrap();
 
         assert_eq!(app.preview_mode, PreviewMode::Hidden);
@@ -697,7 +718,28 @@ mod tests {
         assert_eq!(app.preview_mode, PreviewMode::Rendered);
     }
 
+    #[test]
+    fn toggle_preview_full_cycle() {
+        let mut app = make_app();
+        // Rendered -> Html -> Hidden -> Rendered
+        app.handle_action(EditorAction::TogglePreview).unwrap();
+        assert_eq!(app.preview_mode, PreviewMode::Html);
+
+        app.handle_action(EditorAction::TogglePreview).unwrap();
+        assert_eq!(app.preview_mode, PreviewMode::Hidden);
+
+        app.handle_action(EditorAction::TogglePreview).unwrap();
+        assert_eq!(app.preview_mode, PreviewMode::Rendered);
+    }
+
     // Preview scrolling
+
+    #[test]
+    fn initial_preview_scroll_html_is_zero() {
+        let app = make_app();
+
+        assert_eq!(app.preview_scroll_html, 0);
+    }
 
     #[test]
     fn preview_scroll_down_increments() {
@@ -720,6 +762,40 @@ mod tests {
         let app = make_app();
 
         assert_eq!(app.last_preview_width, 80);
+    }
+
+    // Independent scroll positions
+
+    #[test]
+    fn scroll_down_in_rendered_mode_does_not_affect_html_scroll() {
+        let mut app = make_app();
+        app.preview_mode = PreviewMode::Rendered;
+        app.handle_action(EditorAction::PreviewScrollDown).unwrap();
+
+        assert_eq!(app.preview_scroll, 5);
+        assert_eq!(
+            app.preview_scroll_html, 0,
+            "html scroll must be independent"
+        );
+    }
+
+    #[test]
+    fn scroll_down_in_html_mode_does_not_affect_rendered_scroll() {
+        let mut app = make_app();
+        app.preview_mode = PreviewMode::Html;
+        app.handle_action(EditorAction::PreviewScrollDown).unwrap();
+
+        assert_eq!(app.preview_scroll_html, 5);
+        assert_eq!(app.preview_scroll, 0, "rendered scroll must be independent");
+    }
+
+    #[test]
+    fn scroll_up_saturates_at_zero_for_html_mode() {
+        let mut app = make_app();
+        app.preview_mode = PreviewMode::Html;
+        app.handle_action(EditorAction::PreviewScrollUp).unwrap();
+
+        assert_eq!(app.preview_scroll_html, 0, "scroll must not go below 0");
     }
 
     // doc_revision increments on edit
