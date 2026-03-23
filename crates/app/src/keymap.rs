@@ -12,6 +12,13 @@
 //!   2. Backspace -> CommandBackspace
 //!   3. Enter -> ExecuteCommand
 //!   4. Esc -> ExitInsert (used to exit Command mode)
+//! - Saerch mode: Similar to Command mode, but produces search-specific actions.
+//!   1. Printable keys -> SearchInput(c)
+//!   2. Backspace -> SearchBackspace
+//!   3. Enter -> CommitSearch
+//!   4. Esc -> CancelSearch
+//!   5. Right / n -> SearchNext
+//!   6. Left / N -> SearchPrev
 
 use std::time::{Duration, Instant};
 
@@ -30,7 +37,7 @@ use alloy_core::EditorMode;
 #[derive(Debug, Clone)]
 pub enum EditorAction {
     // Mode transitions
-    /// Normal -> Insert
+    /// Normal / Command -> Insert
     EnterInsert,
 
     /// Insert -> Normal
@@ -38,6 +45,12 @@ pub enum EditorAction {
 
     /// Normal -> Command (`:` prompt)
     EnterCommand,
+
+    /// Normal -> Search (Literal)
+    EnterLiteralSearch,
+
+    /// Normal -> Search (Regex),
+    EnterRegexSearch,
 
     // Normal-mode motions
     MoveLeft,
@@ -66,15 +79,21 @@ pub enum EditorAction {
     PreviewScrollUp,
 
     /// Cycle the preview mode (Rendered -> Hidden -> Rendered)
-    /// TODO: Html added in Chunk 4.1
     TogglePreview,
 
     // Normal-mode app-level actions
     Save,
     Quit,
 
+    // Sarch navigation (active after CommitSearch)
+    /// Move to the next search match
+    SearchNext,
+
+    /// Move to the previous search match
+    SearchPrev,
+
     // Insert-mode passthrough
-    /// A key that should be forwarded verbatim to `tui-textarea::TextArea::input`.
+    /// A key that should be forwarded verbatim to `tui-textarea::TextArea::input`
     TextInput(Input),
 
     // Command-mode actions
@@ -86,6 +105,19 @@ pub enum EditorAction {
 
     /// Execute the current contents of `App::command_input`
     ExecuteCommand,
+
+    // Search-mode actions
+    /// Append a character to the search pattern
+    SearchInput(char),
+
+    /// Remove the last character from the search pattern
+    SearchBackspace,
+
+    /// Commit the search and return to Normal mode
+    CommitSearch,
+
+    /// Cancel the search and restore the cursor to its pre-search position
+    CancelSearch,
 
     // Catch all
     /// A key that has no bound action in the current mode. Silently ignored.
@@ -120,6 +152,8 @@ pub(crate) enum NormalKey {
     Colon,
     Backspace,
     Delete,
+    Slash,
+    Question,
 }
 
 /// Variant-only action enum (no payloads) for the static binding table.
@@ -127,6 +161,8 @@ pub(crate) enum NormalKey {
 enum NormalAction {
     EnterInsert,
     EnterCommand,
+    EnterLiteralSearch,
+    EnterRegexSearch,
     MoveLeft,
     MoveRight,
     MoveUp,
@@ -144,6 +180,8 @@ enum NormalAction {
     TogglePreview,
     Save,
     Quit,
+    SearchNext,
+    SearchPrev,
 }
 
 impl From<NormalAction> for EditorAction {
@@ -151,6 +189,8 @@ impl From<NormalAction> for EditorAction {
         match value {
             NormalAction::EnterInsert => EditorAction::EnterInsert,
             NormalAction::EnterCommand => EditorAction::EnterCommand,
+            NormalAction::EnterLiteralSearch => EditorAction::EnterLiteralSearch,
+            NormalAction::EnterRegexSearch => EditorAction::EnterRegexSearch,
             NormalAction::MoveLeft => EditorAction::MoveLeft,
             NormalAction::MoveRight => EditorAction::MoveRight,
             NormalAction::MoveUp => EditorAction::MoveUp,
@@ -168,6 +208,8 @@ impl From<NormalAction> for EditorAction {
             NormalAction::TogglePreview => EditorAction::TogglePreview,
             NormalAction::Save => EditorAction::Save,
             NormalAction::Quit => EditorAction::Quit,
+            NormalAction::SearchNext => EditorAction::SearchNext,
+            NormalAction::SearchPrev => EditorAction::SearchPrev,
         }
     }
 }
@@ -185,6 +227,14 @@ fn default_normal_bindings() -> Vec<Binding> {
         Binding {
             keys: vec![Colon],
             action: EnterCommand,
+        },
+        Binding {
+            keys: vec![Slash],
+            action: EnterLiteralSearch,
+        },
+        Binding {
+            keys: vec![Question],
+            action: EnterRegexSearch,
         },
         // Arrow keys (always available regardless of hjkl preference)
         Binding {
@@ -276,22 +326,33 @@ fn default_normal_bindings() -> Vec<Binding> {
             keys: vec![CtrlW],
             action: Quit,
         },
+        // Search navigation (available in Normal mode after CommitSearch)
         Binding {
-            keys: vec![Char('q')],
-            action: Quit,
+            keys: vec![Char('n')],
+            action: SearchNext,
+        },
+        Binding {
+            keys: vec![Char('N')],
+            action: SearchPrev,
         },
     ]
 }
 
-/// Convert a crossterm `KeyEvent` to our simplified `NormalKey`, returning `None` for keys we don't handle in Normal-mode (they become `Unbound`).
+/// Converts a crossterm `KeyEvent` to the simplified `NormalKey`.
+///
+/// Returns `None` for keys not handled in Normal-mode (they become `Unbound`).
 fn to_normal_key(key: &KeyEvent) -> Option<NormalKey> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlS),
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlW),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlW),
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlF),
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => Some(NormalKey::CtrlB),
         (KeyCode::Char(':'), KeyModifiers::NONE) | (KeyCode::Char(':'), KeyModifiers::SHIFT) => {
             Some(NormalKey::Colon)
+        }
+        (KeyCode::Char('/'), KeyModifiers::NONE) => Some(NormalKey::Slash),
+        (KeyCode::Char('?'), KeyModifiers::NONE) | (KeyCode::Char('?'), KeyModifiers::SHIFT) => {
+            Some(NormalKey::Question)
         }
         (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
             Some(NormalKey::Char(c))
@@ -310,7 +371,7 @@ fn to_normal_key(key: &KeyEvent) -> Option<NormalKey> {
 // KeymapDispatcher
 // --------------------------------------------------------------------------
 
-/// Stateful dispatched that maps raw key events to `EditorActions`s.
+/// Stateful dispatcher that maps raw key events to `EditorActions`s.
 ///
 /// One dispatcher instance lives for the lifetime of the application.
 /// Call `dispatch` for every key event from the crossterm event loop.
@@ -372,7 +433,8 @@ impl KeymapDispatcher {
             EditorMode::Insert => self.dispatch_insert(key),
             EditorMode::Normal => self.dispatch_normal(key),
             EditorMode::Command => self.dispatch_command(key),
-            //* Other modes are stubs; treat like Normal for now
+            EditorMode::Search => self.dispatch_search(key),
+            // NOTE: Other modes are stubs; treat like Normal-mode for now
             _ => self.dispatch_normal(key),
         }
     }
@@ -411,6 +473,27 @@ impl KeymapDispatcher {
             KeyCode::Backspace => Some(EditorAction::CommandBackspace),
             KeyCode::Char(c) => Some(EditorAction::CommandInput(c)),
             // All other keys (arrows, function keys, etc.) are ignored in Command mode.
+            _ => Some(EditorAction::Unbound),
+        }
+    }
+
+    /// Search mode dispatch.
+    fn dispatch_search(&self, key: KeyEvent) -> Option<EditorAction> {
+        match key.code {
+            KeyCode::Esc => Some(EditorAction::CancelSearch),
+            KeyCode::Enter => Some(EditorAction::CommitSearch),
+            KeyCode::Backspace => Some(EditorAction::SearchBackspace),
+            // Navigation within Search mode (same keys as Normal mode post-commit).
+            KeyCode::Right => Some(EditorAction::SearchNext),
+            KeyCode::Left => Some(EditorAction::SearchPrev),
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+                Some(EditorAction::SearchNext)
+            }
+            KeyCode::Char('N') | KeyCode::Char('n') if key.modifiers == KeyModifiers::SHIFT => {
+                Some(EditorAction::SearchPrev)
+            }
+            // All other printable keys append to the pattern
+            KeyCode::Char(c) => Some(EditorAction::SearchInput(c)),
             _ => Some(EditorAction::Unbound),
         }
     }
@@ -503,6 +586,50 @@ mod tests {
         assert!(matches!(
             d.dispatch(key(KeyCode::Char(':')), &EditorMode::Normal),
             Some(EditorAction::EnterCommand)
+        ));
+    }
+
+    #[test]
+    fn normal_slash_enters_literal_search() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('/')), &EditorMode::Normal),
+            Some(EditorAction::EnterLiteralSearch)
+        ));
+    }
+
+    #[test]
+    fn normal_question_enters_regex_search() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('?')), &EditorMode::Normal),
+            Some(EditorAction::EnterRegexSearch)
+        ));
+    }
+
+    #[test]
+    fn normal_n_searches_next() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('n')), &EditorMode::Normal),
+            Some(EditorAction::SearchNext)
+        ));
+    }
+
+    #[test]
+    fn normal_shift_n_searches_prev() {
+        let mut d = dispatcher();
+
+        // `N` is Shift+n; crossterm delivers KeyCode::Char('N') with SHIFT modifier.
+        assert!(matches!(
+            d.dispatch(
+                key_mod(KeyCode::Char('N'), KeyModifiers::SHIFT),
+                &EditorMode::Normal
+            ),
+            Some(EditorAction::SearchPrev)
         ));
     }
 
@@ -667,16 +794,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn normal_q_quits() {
-        let mut d = dispatcher();
-
-        assert!(matches!(
-            d.dispatch(key(KeyCode::Char('q')), &EditorMode::Normal),
-            Some(EditorAction::Quit)
-        ));
-    }
-
     // Insert mode
 
     #[test]
@@ -763,6 +880,91 @@ mod tests {
         assert!(matches!(
             d.dispatch(key(KeyCode::Char(' ')), &EditorMode::Command),
             Some(EditorAction::CommandInput(' '))
+        ));
+    }
+
+    // Search
+
+    #[test]
+    fn search_printable_produces_search_input() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('a')), &EditorMode::Search),
+            Some(EditorAction::SearchInput('a'))
+        ));
+    }
+
+    #[test]
+    fn search_backspace_produces_search_backspace() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Backspace), &EditorMode::Search),
+            Some(EditorAction::SearchBackspace)
+        ));
+    }
+
+    #[test]
+    fn search_enter_commits() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Enter), &EditorMode::Search),
+            Some(EditorAction::CommitSearch)
+        ));
+    }
+
+    #[test]
+    fn search_esc_cancels() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Esc), &EditorMode::Search),
+            Some(EditorAction::CancelSearch)
+        ));
+    }
+
+    #[test]
+    fn search_right_navigates_next() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Right), &EditorMode::Search),
+            Some(EditorAction::SearchNext)
+        ));
+    }
+
+    #[test]
+    fn search_left_navigates_prev() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Left), &EditorMode::Search),
+            Some(EditorAction::SearchPrev)
+        ));
+    }
+
+    #[test]
+    fn search_n_navigates_next() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('n')), &EditorMode::Search),
+            Some(EditorAction::SearchNext)
+        ));
+    }
+
+    #[test]
+    fn search_shift_n_navigates_prev() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(
+                key_mod(KeyCode::Char('N'), KeyModifiers::SHIFT),
+                &EditorMode::Search
+            ),
+            Some(EditorAction::SearchPrev)
         ));
     }
 

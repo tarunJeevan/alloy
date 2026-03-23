@@ -7,6 +7,7 @@
 //! - the keymap dispatcher
 //! - the notification queue
 //! - the command-mode input buffer
+//! - the search state
 //! - the preview worker channels and cached preview text
 //!
 //! Architecture note: live buffer vs persistence layer
@@ -30,7 +31,12 @@ use ratatui::{
 };
 use tui_textarea::{CursorMove, TextArea};
 
-use alloy_core::{EditorMode, config::Config, document::Document};
+use alloy_core::{
+    EditorMode,
+    config::Config,
+    document::Document,
+    search::{LARGE_DOC_THRESHOLD_BYTES, SearchKind, SearchState},
+};
 
 use crate::keymap::{EditorAction, KeymapDispatcher};
 use crate::preview_worker::{RenderRequest, RenderResult, WorkerExtensions, spawn_worker};
@@ -106,6 +112,19 @@ pub struct App {
 
     /// Text being typed in Command mode (does NOT include the leading `:`).
     pub command_input: String,
+
+    // Search state
+    /// Active or most-recently-committed search state.
+    ///
+    /// `None` until the user enters Search mode for the first time in this session.
+    /// Retained after committing so `n`/`N` in Normal mode can continue navigating.
+    pub search: Option<SearchState>,
+
+    /// Cursor position saved when Search mode is entered.
+    ///
+    /// Restored on `CancelSearch` (Esc).
+    /// Stored as `(row, col)` matching `tui-textarea`'s 0-indexed coordinate system.
+    search_saved_cursor: (usize, usize),
 
     // Preview state
     /// Which preview mode is currently active.
@@ -193,6 +212,8 @@ impl App {
             keymap: KeymapDispatcher::new(timeout_ms),
             notifications: Vec::new(),
             command_input: String::new(),
+            search: None,
+            search_saved_cursor: (0, 0),
             preview_mode: PreviewMode::Rendered,
             preview_scroll: 0,
             preview_scroll_html: 0,
@@ -312,7 +333,7 @@ impl App {
                 self.preview_html = result.html;
 
                 // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
-                // Users can scroll back down with Ctrl+d.
+                // Users can scroll back down with Ctrl+f.
                 // NOTE: Uncomment if the auto-reset behavior is desired:
                 // self.preview_scroll = 0;
             }
@@ -346,6 +367,119 @@ impl App {
                 self.mode = EditorMode::Command;
                 self.command_input.clear();
                 tracing::debug!("mode -> COMMAND");
+            }
+
+            // Search mode entry
+            EditorAction::EnterLiteralSearch => {
+                let case_insensitive = self.config.editor.search_case_insensitive;
+                self.search_saved_cursor = self.textarea.cursor();
+                self.search = Some(SearchState::new(SearchKind::Literal, case_insensitive));
+                self.mode = EditorMode::Search;
+
+                tracing::debug!("mode -> SEARCH (Literal)");
+            }
+            EditorAction::EnterRegexSearch => {
+                let case_insensitive = self.config.editor.search_case_insensitive;
+                self.search_saved_cursor = self.textarea.cursor();
+                self.search = Some(SearchState::new(SearchKind::Regex, case_insensitive));
+                self.mode = EditorMode::Search;
+
+                tracing::debug!("Mode -> SEARCH (Regex)");
+            }
+
+            // Search mode - pattern editing
+            EditorAction::SearchInput(c) => {
+                let content = self.textarea_content();
+                if let Some(s) = &mut self.search {
+                    s.pattern.push(c);
+                    // Large document guard - skip recompute on very large docs.
+                    // NOTE: Debounce in tick would be the right solution but for MVP, just skip the hot path.
+                    if content.len() <= LARGE_DOC_THRESHOLD_BYTES {
+                        s.recompute(&content);
+                    }
+                    // Move cursor to current match so the user sees incremental results.
+                    if let Some(ref s) = self.search {
+                        if let Some(m) = s.current() {
+                            let (line, col) = (m.line as u16, m.col as u16);
+                            self.textarea.move_cursor(CursorMove::Jump(line, col));
+                        }
+                    }
+                }
+            }
+            EditorAction::SearchBackspace => {
+                let content = self.textarea_content();
+                if let Some(s) = &mut self.search {
+                    s.pattern.pop();
+                    // Large document guard - skip recompute on very large docs.
+                    // NOTE: Debounce in tick would be the right solution but for MVP, just skip the hot path.
+                    if content.len() <= LARGE_DOC_THRESHOLD_BYTES {
+                        s.recompute(&content);
+                    }
+                    // Restore saved cursor if no pattern remains.
+                    if s.pattern.is_empty() {
+                        let (row, col) = self.search_saved_cursor;
+                        self.textarea
+                            .move_cursor(CursorMove::Jump(row as u16, col as u16));
+                    } else if let Some(ref s) = self.search {
+                        if let Some(m) = s.current() {
+                            self.textarea
+                                .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16));
+                        }
+                    }
+                }
+            }
+
+            // Search mode - commit / cancel
+            EditorAction::CommitSearch => {
+                self.mode = EditorMode::Normal;
+                apply_normal_mode_style(&mut self.textarea, &self.config);
+
+                // Move cursor to the current match (already done incrementally but ensures correctness on Enter without any prior navigation).
+                if let Some(ref s) = self.search {
+                    if let Some(m) = s.current() {
+                        self.textarea
+                            .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16))
+                    }
+                }
+                tracing::debug!("search committed; mode -> NORMAL");
+            }
+            EditorAction::CancelSearch => {
+                self.mode = EditorMode::Normal;
+                apply_normal_mode_style(&mut self.textarea, &self.config);
+
+                // Restore the cursor position to what it was before the search was initiated.
+                let (row, col) = self.search_saved_cursor;
+                self.textarea
+                    .move_cursor(CursorMove::Jump(row as u16, col as u16));
+
+                // Clear the search pattern so the status bar doesn't show a stale pattern.
+                if let Some(s) = &mut self.search {
+                    s.pattern.clear();
+                    s.matches.clear();
+                }
+                tracing::debug!("search cancelled; mode -> NORMAL");
+            }
+
+            // Search navigation - available in both Search mode and Normal mode (after Commit).
+            EditorAction::SearchNext => {
+                if let Some(ref mut s) = self.search {
+                    if let Some(m) = s.next_match() {
+                        let (line, col) = (m.line as u16, m.col as u16);
+                        self.textarea.move_cursor(CursorMove::Jump(line, col));
+                    } else if !s.pattern.is_empty() {
+                        self.notify_info("No matches found");
+                    }
+                }
+            }
+            EditorAction::SearchPrev => {
+                if let Some(ref mut s) = self.search {
+                    if let Some(m) = s.prev_match() {
+                        let (line, col) = (m.line as u16, m.col as u16);
+                        self.textarea.move_cursor(CursorMove::Jump(line, col));
+                    } else if !s.pattern.is_empty() {
+                        self.notify_info("No matches found");
+                    }
+                }
             }
 
             // Normal-mode motions
@@ -529,6 +663,9 @@ impl App {
                             self.textarea = TextArea::new(lines);
                             apply_normal_mode_style(&mut self.textarea, &self.config);
 
+                            // Clear search state when a new file is opened.
+                            self.search = None;
+
                             // Trigger a fresh preview render for the newly opened document.
                             self.send_render_request();
 
@@ -589,6 +726,29 @@ impl App {
         } else {
             name
         }
+    }
+
+    /// Human-readable search counter string for the status bar: "3/12" or "5/5".
+    ///
+    /// Returns `None` when there is no active search state or the pattern is empty.
+    pub fn search_counter_str(&self) -> Option<String> {
+        self.search
+            .as_ref()
+            .filter(|s| !s.pattern.is_empty())
+            .map(|s| s.counter_str())
+    }
+
+    /// The current search kind, if a search is active.
+    pub fn search_kind(&self) -> Option<&SearchKind> {
+        self.search.as_ref().map(|s| &s.kind)
+    }
+
+    /// The current search pattern, if a search is active (empty string when cleared).
+    pub fn search_pattern(&self) -> &str {
+        self.search
+            .as_ref()
+            .map(|s| s.pattern.as_str())
+            .unwrap_or("")
     }
 }
 
@@ -844,8 +1004,6 @@ mod tests {
         );
     }
 
-    // Stale render result is discarded
-
     #[test]
     fn stale_render_result_is_not_applied() {
         let mut app = make_app();
@@ -969,6 +1127,125 @@ mod tests {
 
         assert_eq!(app.mode, EditorMode::Normal);
         assert!(app.command_input.is_empty());
+    }
+
+    // Search mode integration
+
+    #[test]
+    fn initial_search_state_is_none() {
+        let app = make_app();
+
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn enter_literal_search_sets_mode_and_creates_state() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+
+        assert_eq!(app.mode, EditorMode::Search);
+        assert!(app.search.is_some());
+        assert_eq!(app.search.as_ref().unwrap().kind, SearchKind::Literal);
+    }
+
+    #[test]
+    fn enter_regex_search_sets_kind_to_regex() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterRegexSearch).unwrap();
+
+        assert_eq!(app.search.as_ref().unwrap().kind, SearchKind::Regex);
+    }
+
+    #[test]
+    fn search_input_appends_to_pattern() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('h')).unwrap();
+        app.handle_action(EditorAction::SearchInput('i')).unwrap();
+
+        assert_eq!(app.search.as_ref().unwrap().pattern, "hi");
+    }
+
+    #[test]
+    fn search_backspace_removes_last_char() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('h')).unwrap();
+        app.handle_action(EditorAction::SearchInput('i')).unwrap();
+        app.handle_action(EditorAction::SearchBackspace).unwrap();
+
+        assert_eq!(app.search.as_ref().unwrap().pattern, "h");
+    }
+
+    #[test]
+    fn commit_search_returns_to_normal_mode() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::CommitSearch).unwrap();
+
+        assert_eq!(app.mode, EditorMode::Normal);
+    }
+
+    #[test]
+    fn cancel_search_returns_to_normal_and_clears_pattern() {
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('x')).unwrap();
+        app.handle_action(EditorAction::CancelSearch).unwrap();
+
+        assert_eq!(app.mode, EditorMode::Normal);
+        // Pattern cleared on cancel.
+        assert!(app.search.as_ref().unwrap().pattern.is_empty());
+    }
+
+    #[test]
+    fn search_counter_str_none_when_no_search() {
+        let app = make_app();
+
+        assert!(app.search_counter_str().is_none());
+    }
+
+    #[test]
+    fn search_counter_str_returns_value_when_pattern_set() {
+        let mut app = make_app();
+        // Seed some content with a known pattern.
+        app.textarea = tui_textarea::TextArea::new(vec!["hello world hello".to_string()]);
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('h')).unwrap();
+        app.handle_action(EditorAction::SearchInput('e')).unwrap();
+        app.handle_action(EditorAction::SearchInput('l')).unwrap();
+        app.handle_action(EditorAction::SearchInput('l')).unwrap();
+        app.handle_action(EditorAction::SearchInput('o')).unwrap();
+
+        let counter = app.search_counter_str();
+
+        assert!(
+            counter.is_some(),
+            "counter_str should be Some when pattern is non-empty"
+        );
+        // "hello world hello" has 2 matches for "hello"; counter should be "1/2".
+        assert_eq!(counter.unwrap(), "1/2");
+    }
+
+    #[test]
+    fn search_next_navigates_to_second_match() {
+        let mut app = make_app();
+        app.textarea = tui_textarea::TextArea::new(vec!["hello world hello".to_string()]);
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('h')).unwrap();
+        app.handle_action(EditorAction::SearchInput('e')).unwrap();
+        app.handle_action(EditorAction::SearchInput('l')).unwrap();
+        app.handle_action(EditorAction::SearchInput('l')).unwrap();
+        app.handle_action(EditorAction::SearchInput('o')).unwrap();
+        app.handle_action(EditorAction::CommitSearch).unwrap();
+
+        // Navigate to next match.
+        app.handle_action(EditorAction::SearchNext).unwrap();
+
+        // Second "hello" starts at col 12.
+        let (_, col) = app.textarea.cursor();
+
+        assert_eq!(col, 12, "cursor should be on the second 'hello'");
     }
 
     // :wq integration: saves to temp file then sets should_quit
