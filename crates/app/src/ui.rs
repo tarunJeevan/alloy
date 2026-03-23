@@ -60,7 +60,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Horizontal: editor (left) + optional preview (right)
     let (editor_area, opt_preview_area) = split_body(app, body_area);
 
-    // The renderer needs the real inner width (sans borders) so it can hard-wrap lines before ratatui sees them. We update the field here before any render call that might queue a new render request.
+    // Update the cached preview width before any render call that might queue a new render request.
     if let Some(preview_area) = opt_preview_area {
         // Subtract 2 for left+right borders. Clamp to a min of 20.
         app.last_preview_width = preview_area.width.saturating_sub(2).max(20);
@@ -335,6 +335,14 @@ fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(
             format!(" {} ", notif.message),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+    } else if let Some(counter) = app.search_counter_str() {
+        // Search match counter - visible in Normal mode after CommitSearch until the search is cancelled or a new search is started.
+        Span::styled(
+            format!(" [{counter}] "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
         let words = word_count(app.textarea.lines());
