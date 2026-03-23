@@ -40,9 +40,16 @@ const MIN_SPLIT_WIDTH: u16 = 40;
 ///
 /// Layout example (preview mode):
 /// ┌────────────────────────────────────────────────┐
-/// │  editor pane (full width)                      │
+/// │  editor pane (50%) / preview pane (50%)        │
 /// ├────────────────────────────────────────────────┤
 /// │  status bar                                    │
+/// └────────────────────────────────────────────────┘
+///
+/// Layout example (search mode):
+/// ┌────────────────────────────────────────────────┐
+/// │  editor body (tui-textarea)                    │
+/// ├────────────────────────────────────────────────┤
+/// │  status bar / search prompt                    │
 /// └────────────────────────────────────────────────┘
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -64,10 +71,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_editor(frame, app, editor_area);
     }
 
-    if app.mode == EditorMode::Command {
-        render_command_prompt(frame, app, bottom_area);
-    } else {
-        render_status(frame, app, bottom_area);
+    match app.mode {
+        EditorMode::Command => render_command_prompt(frame, app, bottom_area),
+        EditorMode::Search => render_search_prompt(frame, app, bottom_area),
+        _ => render_status(frame, app, bottom_area),
     }
 }
 
@@ -104,7 +111,8 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     let (border_color, border_modifier) = match app.mode {
         EditorMode::Insert => (Color::LightCyan, Modifier::BOLD),
         EditorMode::Command => (Color::Magenta, Modifier::BOLD),
-        //* NOTE: Adjust color settings for other modes or import from user config
+        EditorMode::Search => (Color::Yellow, Modifier::BOLD),
+        // NOTE: Adjust color settings for other modes or import from user config
         _ => (Color::DarkGray, Modifier::empty()),
     };
 
@@ -156,7 +164,7 @@ fn render_preview_rendered(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the raw HTML source preview.
 ///
-/// NOTE: The HTML string is split on newlines, each line becomes an unstyled `Line`. A line cap of 2000 is enfored by `html_to_lines()` in the `markdown` crate before the result is stored on `App`.
+/// NOTE: The HTML string is split on newlines, each line becomes an unstyled `Line`. A line cap of 2000 is enforced by `html_to_lines()` in the `markdown` crate before the result is stored on `App`.
 ///
 /// Performs the conversion here at render time from `app.preview_html` (a String) because storing a pre-built `Text<'static>` for HTML would require an extra allocation in `App::tick()` on every render cycle even when the user is in Rendered mode.
 fn render_preview_html(frame: &mut Frame, app: &App, area: Rect) {
@@ -218,16 +226,74 @@ fn render_command_prompt(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------
+// Search prompt (replaces status bar in Search mode)
+// ---------------------------------------------------------------
+
+/// Render the single-line search prompt.
+///
+/// Format:
+/// `/` OR `?` prefix, then the pattern, then `_` cursor, then the match counter right-aligned.
+///
+/// Example: `/ hello_					[2/4]`
+fn render_search_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    use alloy_core::search::SearchKind;
+
+    let prefix = match app.search_kind() {
+        Some(SearchKind::Regex) => "?",
+        _ => "/",
+    };
+
+    let pattern = app.search_pattern();
+    let counter = app.search_counter_str().unwrap_or_else(|| "0/0".to_owned());
+
+    // Left portion: `/ pattern_`
+    let prompt_str = format!("{prefix} {pattern}_");
+    let prompt_span = Span::styled(
+        prompt_str,
+        Style::default()
+            .fg(Color::Yellow)
+            .bg(Color::Rgb(30, 30, 30))
+            .add_modifier(Modifier::BOLD),
+    );
+
+    // Right portion: `[2/3]
+    let counter_str = format!("[{counter}]");
+    let counter_span = Span::styled(
+        &counter_str,
+        Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)),
+    );
+
+    // Pad the middle with spaces so the counter appears right-aligned.
+    // prompt_str + spaces + counter_str == area.width (approximately)
+    let prompt_width = prefix.len() + 1 + pattern.len() + 1; // "/ pattern_"
+    let counter_width = counter_str.len();
+    let total = area.width as usize;
+    let padding = total
+        .saturating_sub(prompt_width)
+        .saturating_sub(counter_width);
+
+    let pad_span = Span::styled(
+        " ".repeat(padding),
+        Style::default().bg(Color::Rgb(30, 30, 30)),
+    );
+
+    let line = Line::from(vec![prompt_span, pad_span, counter_span]);
+    let widget = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+
+    frame.render_widget(widget, area);
+}
+
+// ---------------------------------------------------------------
 // Status bar
 // ---------------------------------------------------------------
 
 /// Render the one-line status bar.
 ///
 /// Format:
-/// INSERT   filename.md [+]   |   42:7   |   1,234 words
+/// INSERT   filename.md [+]   |   42:7   |   [P:Rendered]   |   1,234 words
 ///
 /// When a notification is active, the right-hand segment is replaced by the notification message, colored by severity.
-fn render_status(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
     let (mode_bg, mode_fg) = mode_colors(&app.mode);
 
     let mode_span = Span::styled(
