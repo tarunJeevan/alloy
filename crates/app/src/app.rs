@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent;
+use ratatui::style::Modifier;
 use ratatui::{
     style::{Color, Style},
     text::Text,
@@ -80,9 +81,9 @@ pub struct Notification {
     pub expires_at: Instant,
 }
 
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 // App
-// --------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// The complete runtime state of the editor.
 pub struct App {
@@ -186,6 +187,14 @@ impl App {
         // Apply initial styles based on starting mode (Normal).
         apply_normal_mode_style(&mut textarea, &config);
 
+        // Set the search highlight style once - it persists for the lifetime of this textarea.
+        textarea.set_search_style(
+            Style::default()
+                .bg(Color::Rgb(80, 60, 0))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+
         let timeout_ms = config.editor.sequence_timeout_ms;
         let debounce_ms = config.editor.preview_debounce_ms;
 
@@ -248,6 +257,46 @@ impl App {
 
         // Silently drop if the channel is full - the next edit will trigger a new request.
         let _ = self.request_sender.try_send(req);
+    }
+
+    // -----------------------------------------------------------
+    // Search highlight sync
+    // -----------------------------------------------------------
+
+    /// Sync `tui-textarea`'s built-in search highlighting to `self.search`.
+    ///
+    /// Must be called after every mutation of `self.search` or its `pattern`.
+    ///
+    /// Behavior:
+    /// - Active pattern with content -> set the effective regex on the textarea.
+    /// - Empty pattern or no search state -> clear highlights (`set_search_patter("")`).
+    ///
+    /// For `SearchKind::Literal`, the pattern is escaped with `regex::escape` before passing to `tui-textarea` which internally compiles it to a regex.
+    /// For `SearchKind::Regex`, the pattern is used verbatim.
+    /// The `(?i)` flag is prepended when `case_insensitive` is true.
+    fn sync_textarea_search(&mut self) {
+        match &self.search {
+            Some(s) if !s.pattern.is_empty() => {
+                let escaped = match s.kind {
+                    SearchKind::Literal => regex::escape(&s.pattern),
+                    SearchKind::Regex => s.pattern.clone(),
+                };
+                let effective = if s.case_insensitive {
+                    format!("(?i){escaped}")
+                } else {
+                    escaped
+                };
+                if let Err(e) = self.textarea.set_search_pattern(effective) {
+                    tracing::warn!("search highlight: invalid pattern: {e}");
+                    // Best effort - clear rather than leave stale highlights.
+                    let _ = self.textarea.set_search_pattern("");
+                }
+            }
+            _ => {
+                // No active search or empty pattern - clear all highlights.
+                let _ = self.textarea.set_search_pattern("");
+            }
+        }
     }
 
     // -----------------------------------------------------------
@@ -375,6 +424,8 @@ impl App {
                 self.search_saved_cursor = self.textarea.cursor();
                 self.search = Some(SearchState::new(SearchKind::Literal, case_insensitive));
                 self.mode = EditorMode::Search;
+                // Pattern is empty at entry - clear any previous highlights.
+                self.sync_textarea_search();
 
                 tracing::debug!("mode -> SEARCH (Literal)");
             }
@@ -383,6 +434,8 @@ impl App {
                 self.search_saved_cursor = self.textarea.cursor();
                 self.search = Some(SearchState::new(SearchKind::Regex, case_insensitive));
                 self.mode = EditorMode::Search;
+                // Pattern is empty at entry - clear any previous highlights.
+                self.sync_textarea_search();
 
                 tracing::debug!("Mode -> SEARCH (Regex)");
             }
@@ -405,6 +458,8 @@ impl App {
                         }
                     }
                 }
+                // Sync highlights after pattern change.
+                self.sync_textarea_search();
             }
             EditorAction::SearchBackspace => {
                 let content = self.textarea_content();
@@ -427,6 +482,8 @@ impl App {
                         }
                     }
                 }
+                // Sync highlights after pattern change.
+                self.sync_textarea_search();
             }
 
             // Search mode - commit / cancel
@@ -441,6 +498,9 @@ impl App {
                             .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16))
                     }
                 }
+                // Highlights remain active after commit so the user can see all matches.
+                self.sync_textarea_search();
+
                 tracing::debug!("search committed; mode -> NORMAL");
             }
             EditorAction::CancelSearch => {
@@ -457,6 +517,9 @@ impl App {
                     s.pattern.clear();
                     s.matches.clear();
                 }
+                // Clear highlights - pattern is now empty.
+                self.sync_textarea_search();
+
                 tracing::debug!("search cancelled; mode -> NORMAL");
             }
 
@@ -663,8 +726,19 @@ impl App {
                             self.textarea = TextArea::new(lines);
                             apply_normal_mode_style(&mut self.textarea, &self.config);
 
+                            // Re-apply the search highlight style to the new textarea instance.
+                            self.textarea.set_search_style(
+                                Style::default()
+                                    .bg(Color::Rgb(80, 60, 0))
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            );
+
                             // Clear search state when a new file is opened.
                             self.search = None;
+
+                            // Clear highlights on the new textarea (no-op since it's fresh but explicit for clarity).
+                            self.sync_textarea_search();
 
                             // Trigger a fresh preview render for the newly opened document.
                             self.send_render_request();
@@ -1266,5 +1340,92 @@ mod tests {
         // (The actual wq path-less case is tested by execute_w_with_no_path_pushes_error_notification)
         // Here we use the path set on the document from open().
         assert!(app.should_quit, ":wq on a file with a path should quit");
+    }
+
+    // sync_textarea_search
+
+    #[test]
+    fn enter_search_clears_previous_highlights() {
+        // Verifies that entering a new search correctly resets any prior pattern.
+        // We can't directly inspect the internal tui-textarea state, but we can verify no panic occurs and the pattern is empty on entry.
+        let mut app = make_app();
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('x')).unwrap();
+        app.handle_action(EditorAction::CommitSearch).unwrap();
+
+        // Start a second search — should clear and restart.
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+
+        assert!(app.search.as_ref().unwrap().pattern.is_empty());
+    }
+
+    #[test]
+    fn cancel_search_clears_pattern_and_matches() {
+        let mut app = make_app();
+        app.textarea = tui_textarea::TextArea::new(vec!["test content test".to_string()]);
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('t')).unwrap();
+        app.handle_action(EditorAction::SearchInput('e')).unwrap();
+        app.handle_action(EditorAction::SearchInput('s')).unwrap();
+        app.handle_action(EditorAction::SearchInput('t')).unwrap();
+
+        assert!(!app.search.as_ref().unwrap().matches.is_empty());
+
+        app.handle_action(EditorAction::CancelSearch).unwrap();
+
+        assert!(app.search.as_ref().unwrap().pattern.is_empty());
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+    }
+
+    #[test]
+    fn regex_metacharacters_in_literal_search_do_not_panic() {
+        // Literal patterns containing regex metacharacters must be escaped.
+        // e.g. "test.file" should match literal dots, not any character.
+        let mut app = make_app();
+        app.textarea = tui_textarea::TextArea::new(vec!["test.file and test_file".to_string()]);
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        for c in "test.file".chars() {
+            app.handle_action(EditorAction::SearchInput(c)).unwrap();
+        }
+
+        // With regex::escape, "test.file" → "test\.file", matching only the literal dot.
+        // Without escaping it would match both "test.file" and "test_file".
+        let s = app.search.as_ref().unwrap();
+
+        assert_eq!(
+            s.matches.len(),
+            1,
+            "literal dot should not match underscore"
+        );
+    }
+
+    #[test]
+    fn search_counter_str_none_after_cancel() {
+        let mut app = make_app();
+        app.textarea = tui_textarea::TextArea::new(vec!["hello".to_string()]);
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        app.handle_action(EditorAction::SearchInput('h')).unwrap();
+        app.handle_action(EditorAction::CancelSearch).unwrap();
+
+        // Pattern was cleared on cancel, so counter should be None.
+        assert!(app.search_counter_str().is_none());
+    }
+
+    #[test]
+    fn search_counter_str_present_in_normal_mode_after_commit() {
+        let mut app = make_app();
+        app.textarea = tui_textarea::TextArea::new(vec!["hello world hello".to_string()]);
+        app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
+        for c in "hello".chars() {
+            app.handle_action(EditorAction::SearchInput(c)).unwrap();
+        }
+        app.handle_action(EditorAction::CommitSearch).unwrap();
+
+        assert_eq!(app.mode, EditorMode::Normal);
+        // Counter must still be available in Normal mode after commit.
+        assert!(
+            app.search_counter_str().is_some(),
+            "counter should persist after CommitSearch"
+        );
     }
 }

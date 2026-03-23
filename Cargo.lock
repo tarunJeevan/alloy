@@ -47,6 +47,7 @@ dependencies = [
  "crossterm",
  "markdown",
  "ratatui",
+ "regex",
  "scopeguard",
  "serde",
  "tempfile",
@@ -1099,6 +1100,7 @@ checksum = "0a5318dd619ed73c52a9417ad19046724effc1287fb75cdcc4eca1d6ac1acbae"
 dependencies = [
  "crossterm",
  "ratatui",
+ "regex",
  "unicode-width 0.2.0",
 ]
 
