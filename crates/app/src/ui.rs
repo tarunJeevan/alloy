@@ -3,6 +3,8 @@
 //! All Ratatui widget composition lives here. `main.rs` calls `render` once per frame.
 //! No mutable state is stored in this module - everything is derived from `App` on each call.
 
+use std::collections::HashSet;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -11,7 +13,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use alloy_core::{EditorMode, links::LinkTarget};
+use alloy_core::{
+    EditorMode,
+    links::{LinkIndex, LinkTarget},
+};
 
 use crate::app::{App, NotificationLevel, PreviewMode};
 
@@ -156,7 +161,14 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
 fn render_preview_rendered(frame: &mut Frame, app: &App, area: Rect) {
     let block = preview_block(" Preview ", Color::DarkGray);
 
-    let widget = Paragraph::new(app.preview_text.clone())
+    // Conditionally inject OSC-8 hyperlinks when the terminal supports them.
+    let text = if app.hyperlinks_enabled() {
+        inject_osc8(app.preview_text.clone(), &app.link_index)
+    } else {
+        app.preview_text.clone()
+    };
+
+    let widget = Paragraph::new(text)
         .block(block)
         .scroll((app.preview_scroll, 0));
 
@@ -458,6 +470,61 @@ pub fn word_count(lines: &[impl AsRef<str>]) -> usize {
         .iter()
         .flat_map(|l| l.as_ref().split_whitespace())
         .count()
+}
+
+/// Wrap link-text spans in OSC-8 escape sequences so supporting terminals render them as clickable hyperlinks.
+///
+/// The approach injects raw escape bytes into `Span` content. Ratatui passes the content string verbatim to the backend so the sequences reach the terminal without interpretation.
+///
+/// Matching is content-based: a span whose trimmed content equals a known external URL gets wrapped. This is approximate - it only catches spans where the renderer emitted the bare URL as content. It will not catch spans whose content is the link's display text (e.g. "[Click here"). A precise implementation would require renderer-level span tagging (deferred post-MVP).
+///
+/// SAFETY:
+/// This function is only called when `app.hyperlinks_supported` is true. Do NOT call on terminals that don't support OSC-8 - the raw bytes will appear as garbage characters.
+fn inject_osc8(text: Text<'static>, link_index: &LinkIndex) -> Text<'static> {
+    // Build a fast lookup of known external links.
+    let urls: HashSet<String> = link_index
+        .0
+        .iter()
+        .filter_map(|l| {
+            if let LinkTarget::External(url) = &l.target {
+                Some(url.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if urls.is_empty() {
+        return text;
+    }
+
+    let lines = text
+        .lines
+        .into_iter()
+        .map(|line| {
+            let spans = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let content = span.content.trim().to_owned();
+                    if urls.contains(&content) {
+                        // wrap in OSC-8 open + close sequences.
+                        let wrapped = format!(
+                            "\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\",
+                            url = content,
+                            text = span.content
+                        );
+                        Span::styled(wrapped, span.style)
+                    } else {
+                        span
+                    }
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+
+    Text::from(lines)
 }
 
 // ---------------------------------------------------------------

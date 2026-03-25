@@ -40,6 +40,7 @@ pub struct Config {
     pub editor: EditorConfig,
     pub markdown: MarkdownConfig,
     pub ui: UiConfig,
+    pub terminal: TerminalConfig,
 }
 
 /// The config schema version written by this build.
@@ -54,6 +55,7 @@ impl Default for Config {
             editor: EditorConfig::default(),
             markdown: MarkdownConfig::default(),
             ui: UiConfig::default(),
+            terminal: TerminalConfig::default(),
         }
     }
 }
@@ -263,6 +265,45 @@ pub enum PreviewModeConfig {
     Rendered,
     Html,
     Hidden,
+}
+
+// -----------------------------------------------------------------------
+// Terminal Config
+// -----------------------------------------------------------------------
+
+/// Terminal-capability settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// OSC-8 terminal hyperlink emission in the preview pane.
+    ///
+    /// - "off" (default): never emit hyperlinks
+    /// - "auto": emit only when `supports-hyperlinks` detects supprt.
+    /// - "on": always emit (use when auto-detection gives a false negative).
+    pub hyperlinks: HyperlinksMode,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            hyperlinks: HyperlinksMode::Off,
+        }
+    }
+}
+
+/// Controls whether OSC-8 terminal hyperlinks are emitted in the preview pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HyperlinksMode {
+    /// Never emit OSC-8 sequences (safe default until validated per-terminal).
+    #[default]
+    Off,
+
+    /// Emit when `supports-hyperlinks` detects support at startup.
+    Auto,
+
+    /// Always emit regardless of detection result.
+    On,
 }
 
 // -----------------------------------------------------------------------
