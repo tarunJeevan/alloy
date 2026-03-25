@@ -12,13 +12,17 @@
 //!   2. Backspace -> CommandBackspace
 //!   3. Enter -> ExecuteCommand
 //!   4. Esc -> ExitInsert (used to exit Command mode)
-//! - Saerch mode: Similar to Command mode, but produces search-specific actions.
+//! - Search mode: Similar to Command mode, but produces search-specific actions.
 //!   1. Printable keys -> SearchInput(c)
 //!   2. Backspace -> SearchBackspace
 //!   3. Enter -> CommitSearch
 //!   4. Esc -> CancelSearch
 //!   5. Right / n -> SearchNext
 //!   6. Left / N -> SearchPrev
+//! - LinkSelect mode: Similar to Search mode but produces slightly different actions.
+//!   1. `j`/`k`/Tab/BackTab -> Cycle through links
+//!   2. Enter -> Follows link
+//!   3. Esc -> Exit to Normal mode
 
 use std::time::{Duration, Instant};
 
@@ -27,9 +31,9 @@ use tui_textarea::Input;
 
 use alloy_core::EditorMode;
 
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 // EditorAction
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// High-level editor actions, fully decoupled from ray key events.
 ///
@@ -51,6 +55,9 @@ pub enum EditorAction {
 
     /// Normal -> Search (Regex),
     EnterRegexSearch,
+
+    /// Normal -> LinkSelect
+    EnterLinkSelect,
 
     // Normal-mode motions
     MoveLeft,
@@ -85,12 +92,22 @@ pub enum EditorAction {
     Save,
     Quit,
 
-    // Sarch navigation (active after CommitSearch)
+    // Search navigation (active after CommitSearch)
     /// Move to the next search match
     SearchNext,
 
     /// Move to the previous search match
     SearchPrev,
+
+    // Link-select actions
+    /// Advance to the next link in the index
+    LinkSelectNext,
+
+    /// Move to the previous link in the index
+    LinkSelectPrev,
+
+    /// Follow (open/jump to) the currently selected link
+    FollowLink,
 
     // Insert-mode passthrough
     /// A key that should be forwarded verbatim to `tui-textarea::TextArea::input`
@@ -124,9 +141,9 @@ pub enum EditorAction {
     Unbound,
 }
 
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Internal sequence table
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// A compiled entry in the Normal-mode keymap.
 #[derive(Debug)]
@@ -163,6 +180,7 @@ enum NormalAction {
     EnterCommand,
     EnterLiteralSearch,
     EnterRegexSearch,
+    EnterLinkSelect,
     MoveLeft,
     MoveRight,
     MoveUp,
@@ -191,6 +209,7 @@ impl From<NormalAction> for EditorAction {
             NormalAction::EnterCommand => EditorAction::EnterCommand,
             NormalAction::EnterLiteralSearch => EditorAction::EnterLiteralSearch,
             NormalAction::EnterRegexSearch => EditorAction::EnterRegexSearch,
+            NormalAction::EnterLinkSelect => EditorAction::EnterLinkSelect,
             NormalAction::MoveLeft => EditorAction::MoveLeft,
             NormalAction::MoveRight => EditorAction::MoveRight,
             NormalAction::MoveUp => EditorAction::MoveUp,
@@ -235,6 +254,10 @@ fn default_normal_bindings() -> Vec<Binding> {
         Binding {
             keys: vec![Question],
             action: EnterRegexSearch,
+        },
+        Binding {
+            keys: vec![Char('f'), Char('l')],
+            action: EnterLinkSelect,
         },
         // Arrow keys (always available regardless of hjkl preference)
         Binding {
@@ -367,9 +390,9 @@ fn to_normal_key(key: &KeyEvent) -> Option<NormalKey> {
     }
 }
 
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 // KeymapDispatcher
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 /// Stateful dispatcher that maps raw key events to `EditorActions`s.
 ///
@@ -434,8 +457,7 @@ impl KeymapDispatcher {
             EditorMode::Normal => self.dispatch_normal(key),
             EditorMode::Command => self.dispatch_command(key),
             EditorMode::Search => self.dispatch_search(key),
-            // NOTE: Other modes are stubs; treat like Normal-mode for now
-            _ => self.dispatch_normal(key),
+            EditorMode::LinkSelect => self.dispatch_link_select(key),
         }
     }
 
@@ -498,6 +520,19 @@ impl KeymapDispatcher {
         }
     }
 
+    /// Link-select mode dispatch.
+    fn dispatch_link_select(&self, key: KeyEvent) -> Option<EditorAction> {
+        match key.code {
+            KeyCode::Esc => Some(EditorAction::ExitInsert),
+            KeyCode::Enter => Some(EditorAction::FollowLink),
+            KeyCode::Char('j') | KeyCode::Tab | KeyCode::Down => Some(EditorAction::LinkSelectNext),
+            KeyCode::Char('k') | KeyCode::BackTab | KeyCode::Up => {
+                Some(EditorAction::LinkSelectPrev)
+            }
+            _ => Some(EditorAction::Unbound),
+        }
+    }
+
     /// Try to match the curent pending buffer against the binding table.
     fn evaluate_pending(&mut self) -> Option<EditorAction> {
         let pending = &self.pending;
@@ -534,9 +569,9 @@ impl KeymapDispatcher {
     }
 }
 
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 // Tests
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -726,6 +761,118 @@ mod tests {
             "g e should produce MoveDocEnd"
         );
         assert!(d.pending.is_empty());
+    }
+
+    // Link select tests
+
+    #[test]
+    fn normal_f_alone_is_buffered() {
+        let mut d = dispatcher();
+        let action = d.dispatch(key(KeyCode::Char('f')), &EditorMode::Normal);
+
+        assert!(
+            action.is_none(),
+            "'f' alone should be buffered (prefix of `f l`)"
+        );
+        assert_eq!(d.pending.len(), 1);
+    }
+
+    #[test]
+    fn normal_fl_enters_link_select() {
+        let mut d = dispatcher();
+
+        assert!(
+            d.dispatch(key(KeyCode::Char('f')), &EditorMode::Normal)
+                .is_none()
+        );
+
+        let action = d.dispatch(key(KeyCode::Char('l')), &EditorMode::Normal);
+
+        assert!(
+            matches!(action, Some(EditorAction::EnterLinkSelect)),
+            "f l should produce EnterLinkSelect; got {action:?}"
+        );
+        assert!(d.pending.is_empty());
+    }
+
+    #[test]
+    fn link_select_esc_exits() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Esc), &EditorMode::LinkSelect),
+            Some(EditorAction::ExitInsert)
+        ));
+    }
+
+    #[test]
+    fn link_select_enter_follows_link() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Enter), &EditorMode::LinkSelect),
+            Some(EditorAction::FollowLink)
+        ));
+    }
+
+    #[test]
+    fn link_select_j_next() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('j')), &EditorMode::LinkSelect),
+            Some(EditorAction::LinkSelectNext)
+        ));
+    }
+
+    #[test]
+    fn link_select_k_prev() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Char('k')), &EditorMode::LinkSelect),
+            Some(EditorAction::LinkSelectPrev)
+        ));
+    }
+
+    #[test]
+    fn link_select_tab_next() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Tab), &EditorMode::LinkSelect),
+            Some(EditorAction::LinkSelectNext)
+        ));
+    }
+
+    #[test]
+    fn link_select_backtab_prev() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::BackTab), &EditorMode::LinkSelect),
+            Some(EditorAction::LinkSelectPrev)
+        ));
+    }
+
+    #[test]
+    fn link_select_down_arrow_next() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Down), &EditorMode::LinkSelect),
+            Some(EditorAction::LinkSelectNext)
+        ));
+    }
+
+    #[test]
+    fn link_select_up_arrow_prev() {
+        let mut d = dispatcher();
+
+        assert!(matches!(
+            d.dispatch(key(KeyCode::Up), &EditorMode::LinkSelect),
+            Some(EditorAction::LinkSelectPrev)
+        ));
     }
 
     // Preview control tests
