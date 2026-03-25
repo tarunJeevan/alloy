@@ -8,6 +8,7 @@
 //! - the notification queue
 //! - the command-mode input buffer
 //! - the search state
+//! - the link index + link+select worker
 //! - the preview worker channels and cached preview text
 //!
 //! Architecture note: live buffer vs persistence layer
@@ -36,6 +37,7 @@ use alloy_core::{
     EditorMode,
     config::Config,
     document::Document,
+    links::{LinkIndex, LinkTarget},
     search::{LARGE_DOC_THRESHOLD_BYTES, SearchKind, SearchState},
 };
 
@@ -126,6 +128,15 @@ pub struct App {
     /// Restored on `CancelSearch` (Esc).
     /// Stored as `(row, col)` matching `tui-textarea`'s 0-indexed coordinate system.
     search_saved_cursor: (usize, usize),
+
+    // Link state
+    /// All links extracted from the most recent render pass.
+    ///
+    /// Updated in `tick()` whenever a matching `RenderResult` arrives.
+    pub link_index: LinkIndex,
+
+    /// 0-indexed cursor into `link_index`. Wraps at both ends in `LinkSelect` mode.
+    pub link_cursor: usize,
 
     // Preview state
     /// Which preview mode is currently active.
@@ -223,6 +234,8 @@ impl App {
             command_input: String::new(),
             search: None,
             search_saved_cursor: (0, 0),
+            link_index: LinkIndex::new(),
+            link_cursor: 0,
             preview_mode: PreviewMode::Rendered,
             preview_scroll: 0,
             preview_scroll_html: 0,
@@ -380,6 +393,7 @@ impl App {
             if result.revision == self.doc_revision {
                 self.preview_text = result.rendered;
                 self.preview_html = result.html;
+                self.link_index = result.link_index;
 
                 // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
                 // Users can scroll back down with Ctrl+f.
@@ -416,6 +430,36 @@ impl App {
                 self.mode = EditorMode::Command;
                 self.command_input.clear();
                 tracing::debug!("mode -> COMMAND");
+            }
+
+            // LinkSelect mode
+            EditorAction::EnterLinkSelect => {
+                if self.link_index.is_empty() {
+                    self.notify_info("No links in document");
+                } else {
+                    self.link_cursor = 0;
+                    self.mode = EditorMode::LinkSelect;
+                    tracing::debug!("mode -> LINK_SELECT ({} links)", self.link_index.len());
+                }
+            }
+            EditorAction::LinkSelectNext => {
+                if !self.link_index.is_empty() {
+                    self.link_cursor = (self.link_cursor + 1) % self.link_index.len();
+                }
+            }
+            EditorAction::LinkSelectPrev => {
+                if !self.link_index.is_empty() {
+                    self.link_cursor = self
+                        .link_cursor
+                        .checked_sub(1)
+                        .unwrap_or(self.link_index.len() - 1);
+                }
+            }
+            EditorAction::FollowLink => {
+                self.follow_current_link();
+                self.mode = EditorMode::Normal;
+                apply_normal_mode_style(&mut self.textarea, &self.config);
+                tracing::debug!("followed link; mode -> NORMAL");
             }
 
             // Search mode entry
@@ -659,6 +703,65 @@ impl App {
     }
 
     // -----------------------------------------------------------
+    // Link following
+    // -----------------------------------------------------------
+
+    /// Follow the currently highlighted link in `LinkSelect` mode.
+    ///
+    /// Behavior by target type:
+    /// - `External` -> open in the system browser via `webbrowser` (fire-and-forget thread)
+    /// - `InternalAnchor` -> jump the editor cursor to the source link of the matching anchor
+    /// - `WikiLink` -> show a notification that cross-file navigation is deffered to post-MVP
+    /// - `FilePath` -> show a notification that file path navigation is deffered to post-MVP
+    fn follow_current_link(&mut self) {
+        let Some(link) = self.link_index.get(self.link_cursor) else {
+            return;
+        };
+
+        // Clone to satisfy borrow checker (we need `&mut self` below).
+        let target = link.target.clone();
+        let source_line = link.source_line;
+
+        match target {
+            LinkTarget::External(url) => {
+                tracing::info!(url, "opening external link in browser");
+                let url_clone = url.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = webbrowser::open(&url) {
+                        tracing::warn!("failed to open browser for '{url}': {e}");
+                    }
+                });
+                self.notify_info(format!("Opening: {url_clone}"));
+            }
+            LinkTarget::InternalAnchor(anchor) => {
+                // Find the first entry in the index whose own target is an `InternalAnchor` with the same ID - that entry carries the source_line of the heading itself.
+                let target_line = self
+                    .link_index
+                    .0
+                    .iter()
+                    .find(|l| matches!(&l.target, LinkTarget::InternalAnchor(a) if *a == anchor))
+                    .map(|l| l.source_col)
+                    .unwrap_or(source_line); // Fallback: Jump to the link's own line
+
+                self.textarea
+                    .move_cursor(CursorMove::Jump(target_line as u16, 0));
+                self.notify_info(format!("Jumped to #{anchor}"));
+            }
+            LinkTarget::WikiLink(page) => {
+                self.notify_warn(format!(
+                    "Wiki link navigation not supported in MVP: [[{page}]]"
+                ));
+            }
+            LinkTarget::FilePath(path) => {
+                self.notify_warn(format!(
+                    "File path navigation not supported in MVP: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
     // Command execution
     // -----------------------------------------------------------
 
@@ -736,6 +839,10 @@ impl App {
 
                             // Clear search state when a new file is opened.
                             self.search = None;
+
+                            // Clear link state for the new document.
+                            self.link_index = LinkIndex::new();
+                            self.link_cursor = 0;
 
                             // Clear highlights on the new textarea (no-op since it's fresh but explicit for clarity).
                             self.sync_textarea_search();
@@ -824,6 +931,27 @@ impl App {
             .map(|s| s.pattern.as_str())
             .unwrap_or("")
     }
+
+    /// The display string for the currently highlighted link target.
+    ///
+    /// Returns `None` when not in LinkSelect mode or the index is empty.
+    pub fn current_link_display(&self) -> Option<&str> {
+        if self.mode != EditorMode::LinkSelect {
+            return None;
+        }
+        self.link_index
+            .get(self.link_cursor)
+            .map(|l| l.target.display_str())
+    }
+
+    /// 1-indexed position string for LinkSelect: e.g. "2/8".
+    pub fn link_select_counter(&self) -> String {
+        if self.link_index.is_empty() {
+            "0/0".to_owned()
+        } else {
+            format!("{}/{}", self.link_cursor + 1, self.link_index.len())
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -880,6 +1008,7 @@ fn apply_insert_mode_style(textarea: &mut TextArea<'static>, _config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_core::links::Link;
 
     // split_command
 
@@ -1032,6 +1161,188 @@ mod tests {
         assert_eq!(app.preview_scroll_html, 0, "scroll must not go below 0");
     }
 
+    // LinkSelect tests
+
+    #[test]
+    fn initial_link_index_is_empty() {
+        let app = make_app();
+
+        assert!(app.link_index.is_empty());
+        assert_eq!(app.link_cursor, 0);
+    }
+
+    #[test]
+    fn enter_link_select_with_empty_index_shows_notification() {
+        let mut app = make_app();
+        // Link index is empty at startup.
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+
+        // Mode should NOT have changed to LinkSelect.
+        assert_ne!(app.mode, EditorMode::LinkSelect);
+        assert!(
+            app.active_notification().is_some(),
+            "expected a notification about no links"
+        );
+    }
+
+    #[test]
+    fn enter_link_select_with_links_changes_mode() {
+        let mut app = make_app();
+        // Inject a link directly into the index.
+        app.link_index.push(Link {
+            display_text: "Test".into(),
+            target: LinkTarget::External("https://test.com".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+
+        assert_eq!(app.mode, EditorMode::LinkSelect);
+        assert_eq!(app.link_cursor, 0);
+    }
+
+    #[test]
+    fn link_select_next_advances_cursor() {
+        let mut app = make_app();
+        for i in 0..3 {
+            app.link_index.push(Link {
+                display_text: format!("Link {i}"),
+                target: LinkTarget::External(format!("https://{i}.com")),
+                source_line: i,
+                source_col: 0,
+            });
+        }
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+        app.handle_action(EditorAction::LinkSelectNext).unwrap();
+
+        assert_eq!(app.link_cursor, 1);
+
+        app.handle_action(EditorAction::LinkSelectNext).unwrap();
+
+        assert_eq!(app.link_cursor, 2);
+
+        // Wrap around
+        app.handle_action(EditorAction::LinkSelectNext).unwrap();
+
+        assert_eq!(app.link_cursor, 0);
+    }
+
+    #[test]
+    fn link_select_prev_wraps_at_zero() {
+        let mut app = make_app();
+        for i in 0..3 {
+            app.link_index.push(Link {
+                display_text: format!("Link {i}"),
+                target: LinkTarget::External(format!("https://{i}.com")),
+                source_line: i,
+                source_col: 0,
+            });
+        }
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+        // Cursor is 0; prev should wrap to 2.
+        app.handle_action(EditorAction::LinkSelectPrev).unwrap();
+
+        assert_eq!(app.link_cursor, 2);
+    }
+
+    #[test]
+    fn follow_link_returns_to_normal_mode() {
+        let mut app = make_app();
+        app.link_index.push(Link {
+            display_text: "Wiki".into(),
+            target: LinkTarget::WikiLink("SomePage".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+        app.handle_action(EditorAction::FollowLink).unwrap();
+
+        assert_eq!(app.mode, EditorMode::Normal);
+    }
+
+    #[test]
+    fn follow_wiki_link_shows_warning() {
+        let mut app = make_app();
+        app.link_index.push(Link {
+            display_text: "Wiki".into(),
+            target: LinkTarget::WikiLink("SomePage".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+        app.handle_action(EditorAction::FollowLink).unwrap();
+
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.level == NotificationLevel::Warn),
+            "following a wiki link should produce a warning notification"
+        );
+    }
+
+    #[test]
+    fn follow_file_path_shows_warning() {
+        let mut app = make_app();
+        app.link_index.push(Link {
+            display_text: "Docs".into(),
+            target: LinkTarget::FilePath("./notes.md".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+        app.handle_action(EditorAction::FollowLink).unwrap();
+
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.level == NotificationLevel::Warn),
+            "following a file path link should produce a warning notification"
+        );
+    }
+
+    #[test]
+    fn current_link_display_none_when_not_in_link_select_mode() {
+        let app = make_app();
+
+        assert!(app.current_link_display().is_none());
+    }
+
+    #[test]
+    fn current_link_display_returns_url_in_link_select_mode() {
+        let mut app = make_app();
+        app.link_index.push(Link {
+            display_text: "Example".into(),
+            target: LinkTarget::External("https://example.com".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        app.handle_action(EditorAction::EnterLinkSelect).unwrap();
+
+        assert_eq!(app.current_link_display(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn link_select_counter_empty() {
+        let app = make_app();
+
+        assert_eq!(app.link_select_counter(), "0/0");
+    }
+
+    #[test]
+    fn link_select_counter_with_links() {
+        let mut app = make_app();
+        for _ in 0..3 {
+            app.link_index.push(Link {
+                display_text: "L".into(),
+                target: LinkTarget::External("https://x.com".into()),
+                source_line: 0,
+                source_col: 0,
+            });
+        }
+
+        assert_eq!(app.link_select_counter(), "1/3");
+    }
+
     // doc_revision increments on edit
 
     #[test]
@@ -1039,8 +1350,8 @@ mod tests {
         let mut app = make_app();
 
         // Seed the textarea with content so DeleteCharBackward has something to delete and is guaranteed to call send_render_request.
-        app.textarea = tui_textarea::TextArea::new(vec!["hello".to_string()]);
-        app.textarea.move_cursor(tui_textarea::CursorMove::End);
+        app.textarea = TextArea::new(vec!["hello".to_string()]);
+        app.textarea.move_cursor(CursorMove::End);
 
         let rev_before = app.doc_revision;
 
@@ -1057,8 +1368,8 @@ mod tests {
     fn multiple_edits_keep_incrementing_doc_revision() {
         let mut app = make_app();
 
-        app.textarea = tui_textarea::TextArea::new(vec!["hello world".to_string()]);
-        app.textarea.move_cursor(tui_textarea::CursorMove::End);
+        app.textarea = TextArea::new(vec!["hello world".to_string()]);
+        app.textarea.move_cursor(CursorMove::End);
 
         let rev0 = app.doc_revision;
         app.handle_action(EditorAction::DeleteCharBackward).unwrap();
@@ -1283,7 +1594,7 @@ mod tests {
     fn search_counter_str_returns_value_when_pattern_set() {
         let mut app = make_app();
         // Seed some content with a known pattern.
-        app.textarea = tui_textarea::TextArea::new(vec!["hello world hello".to_string()]);
+        app.textarea = TextArea::new(vec!["hello world hello".to_string()]);
         app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
         app.handle_action(EditorAction::SearchInput('h')).unwrap();
         app.handle_action(EditorAction::SearchInput('e')).unwrap();
@@ -1304,7 +1615,7 @@ mod tests {
     #[test]
     fn search_next_navigates_to_second_match() {
         let mut app = make_app();
-        app.textarea = tui_textarea::TextArea::new(vec!["hello world hello".to_string()]);
+        app.textarea = TextArea::new(vec!["hello world hello".to_string()]);
         app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
         app.handle_action(EditorAction::SearchInput('h')).unwrap();
         app.handle_action(EditorAction::SearchInput('e')).unwrap();
@@ -1362,7 +1673,7 @@ mod tests {
     #[test]
     fn cancel_search_clears_pattern_and_matches() {
         let mut app = make_app();
-        app.textarea = tui_textarea::TextArea::new(vec!["test content test".to_string()]);
+        app.textarea = TextArea::new(vec!["test content test".to_string()]);
         app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
         app.handle_action(EditorAction::SearchInput('t')).unwrap();
         app.handle_action(EditorAction::SearchInput('e')).unwrap();
@@ -1382,7 +1693,7 @@ mod tests {
         // Literal patterns containing regex metacharacters must be escaped.
         // e.g. "test.file" should match literal dots, not any character.
         let mut app = make_app();
-        app.textarea = tui_textarea::TextArea::new(vec!["test.file and test_file".to_string()]);
+        app.textarea = TextArea::new(vec!["test.file and test_file".to_string()]);
         app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
         for c in "test.file".chars() {
             app.handle_action(EditorAction::SearchInput(c)).unwrap();
@@ -1402,7 +1713,7 @@ mod tests {
     #[test]
     fn search_counter_str_none_after_cancel() {
         let mut app = make_app();
-        app.textarea = tui_textarea::TextArea::new(vec!["hello".to_string()]);
+        app.textarea = TextArea::new(vec!["hello".to_string()]);
         app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
         app.handle_action(EditorAction::SearchInput('h')).unwrap();
         app.handle_action(EditorAction::CancelSearch).unwrap();
@@ -1414,7 +1725,7 @@ mod tests {
     #[test]
     fn search_counter_str_present_in_normal_mode_after_commit() {
         let mut app = make_app();
-        app.textarea = tui_textarea::TextArea::new(vec!["hello world hello".to_string()]);
+        app.textarea = TextArea::new(vec!["hello world hello".to_string()]);
         app.handle_action(EditorAction::EnterLiteralSearch).unwrap();
         for c in "hello".chars() {
             app.handle_action(EditorAction::SearchInput(c)).unwrap();

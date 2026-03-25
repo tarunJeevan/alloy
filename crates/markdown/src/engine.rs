@@ -7,8 +7,15 @@
 //! Thread safety:
 //!
 //! Implementations must be `Send + Sync` so that an `Arc<dyn MarkdownEngine>` can be shared with the preview worker thread.
+//!
+//! `render_terminal_with_links`:
+//!
+//! - The extended method that returns both the rendered `Text` and a `LinkIndex`. Engines that support link extraction override this.
+//! - The default implementation delegates to `render_terminal` and returns an empty index so existing engines don't break.
 
 use ratatui::text::Text;
+
+use alloy_core::links::LinkIndex;
 
 /// A Markdown parser/renderer backend.
 ///
@@ -23,4 +30,13 @@ pub trait MarkdownEngine: Send + Sync {
     ///
     /// This is used by `PreviewMode::Html` (Phase 4). Implementations that don't yet support HTML output should return `unimplemented!()` or a commented-out placeholder. The calling code guards against that with the preview mode check.
     fn render_html(&self, src: &str) -> String;
+
+    /// Parse `src`, produce `Text` AND extract a `LinkIndex` in a single pass.
+    ///
+    /// The default implemetation calls `render_terminal` and returns an empty `LinkIndex`. Engines that support link extraction (currently `PulldownEngine`) override this to avoid a second parse pass.
+    ///
+    /// The preview worker always calls this method so the link index ia available to the UI with zero extra cost.
+    fn render_terminal_with_links(&self, src: &str, col_width: u16) -> (Text<'static>, LinkIndex) {
+        (self.render_terminal(src, col_width), LinkIndex::new())
+    }
 }

@@ -78,6 +78,7 @@ impl ComrakExtensions {
         EngineExtensions {
             gfm: self.gfm,
             footnotes: self.footnotes,
+            wiki_links: self.wiki_links,
         }
     }
 }

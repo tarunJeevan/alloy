@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use alloy_core::EditorMode;
+use alloy_core::{EditorMode, links::LinkTarget};
 
 use crate::app::{App, NotificationLevel, PreviewMode};
 
@@ -74,6 +74,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.mode {
         EditorMode::Command => render_command_prompt(frame, app, bottom_area),
         EditorMode::Search => render_search_prompt(frame, app, bottom_area),
+        EditorMode::LinkSelect => render_link_select_prompt(frame, app, bottom_area),
         _ => render_status(frame, app, bottom_area),
     }
 }
@@ -112,7 +113,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         EditorMode::Insert => (Color::LightCyan, Modifier::BOLD),
         EditorMode::Command => (Color::Magenta, Modifier::BOLD),
         EditorMode::Search => (Color::Yellow, Modifier::BOLD),
-        // NOTE: Adjust color settings for other modes or import from user config
+        EditorMode::LinkSelect => (Color::Blue, Modifier::BOLD),
         _ => (Color::DarkGray, Modifier::empty()),
     };
 
@@ -279,6 +280,71 @@ fn render_search_prompt(frame: &mut Frame, app: &App, area: Rect) {
 
     let line = Line::from(vec![prompt_span, pad_span, counter_span]);
     let widget = Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+
+    frame.render_widget(widget, area);
+}
+
+// ---------------------------------------------------------------
+// LinkSelect prompt (replaces status bar in LinkSelect mode)
+// ---------------------------------------------------------------
+
+/// Render the single-line link-selection prompt.
+///
+/// Format:
+/// `[LINKS 2/4] -> https://example.com		j/k:nav  Enter:follow  Esc:cancel`
+fn render_link_select_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    let counter = app.link_select_counter();
+    let target_str = app.current_link_display().unwrap_or("-");
+
+    // Link type indicator
+    let kind_label = app
+        .link_index
+        .get(app.link_cursor)
+        .map(|l| match &l.target {
+            LinkTarget::External(_) => "EXTERNAL",
+            LinkTarget::InternalAnchor(_) => "ANCHOR",
+            LinkTarget::WikiLink(_) => "WIKILINK",
+            LinkTarget::FilePath(_) => "FILEPATH",
+        })
+        .unwrap_or("-");
+
+    // Left portion: `[LINKS 2/3] EXTERNAL -> https://example.com`
+    let left_str = format!("[LINKS {counter}] {kind_label} → {target_str}");
+    let left_span = Span::styled(
+        left_str.clone(),
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Rgb(20, 40, 80))
+            .add_modifier(Modifier::BOLD),
+    );
+
+    // Right portion: keyboard hints (shown only if there's room)
+    let hint_str = " j/k:nav | Enter:follow | Esc:cancel ";
+    let hint_span = Span::styled(
+        hint_str,
+        Style::default()
+            .fg(Color::DarkGray)
+            .bg(Color::Rgb(20, 40, 80)),
+    );
+
+    let left_width = left_str.len();
+    let hint_width = hint_str.len();
+    let total = area.width as usize;
+    let padding = total.saturating_sub(left_width).saturating_sub(hint_width);
+
+    let pad_span = Span::styled(
+        " ".repeat(padding),
+        Style::default().bg(Color::Rgb(20, 40, 80)),
+    );
+
+    // If the terminal is too narrow to show hints, omit them gracefully.
+    let line = if total > left_width + hint_width + 2 {
+        Line::from(vec![left_span, pad_span, hint_span])
+    } else {
+        Line::from(vec![left_span])
+    };
+
+    let widget = Paragraph::new(line).style(Style::default().bg(Color::Rgb(20, 40, 80)));
 
     frame.render_widget(widget, area);
 }

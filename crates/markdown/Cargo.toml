@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+alloy-core.path = "../../crates/core"
+
 anyhow.workspace = true
 ratatui.workspace = true
 thiserror.workspace = true

@@ -4,7 +4,8 @@
 //!
 //! Dual-output design:
 //!
-//! - The worker always produces both `Text<'static>` via `PulldownEngine` and `String` via `ComrakEngine` in a single render cycle. The UI chooses which to display based on `PreviewMode`. This avoids a second render pass on mode toggle and keeps the worker stateless with respect to the preview mode.
+//! - The worker always produces both `Text<'static>` via `PulldownEngine`, `String` HTML via `ComrakEngine`, and a `LinkIndex` from `render_terminal_with_links` in a single render cycle.
+//! - The `LinkIndex` is always populated from the terminal render pass at zero extra cost since `render_terminal_with_links` performs link extraction during the same parse/walk as rendering.
 //! - HTML generation via comrak is fast (typically <1 ms for moderate documents) and negligible compared with the debounce window, so the cost is unconditionally paid.
 //!
 //! Debounce algorithm (recv_timeout):
@@ -35,6 +36,7 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
+use alloy_core::links::LinkIndex;
 use markdown::{
     ComrakEngine, ComrakExtensions, MarkdownEngine, PulldownEngine,
     engines::pulldown::EngineExtensions,
@@ -61,6 +63,7 @@ impl WorkerExtensions {
         EngineExtensions {
             gfm: self.gfm,
             footnotes: self.footnotes,
+            wiki_links: self.wiki_links,
         }
     }
 
@@ -106,6 +109,11 @@ pub struct RenderResult {
 
     /// Raw HTML stirng (via `ComrakEngine`).
     pub html: String,
+
+    /// All links extracted during the terminal render pass.
+    ///
+    /// Built for free during `render_terminal_with_links` - no extra parse cost.
+    pub link_index: LinkIndex,
 }
 
 // ---------------------------------------------------------
@@ -186,17 +194,20 @@ fn worker_loop(
         // A newtype wrapper to unconditionally implement UnwindSafe on MarkdownEngine to satisfy compiler requirements.
         use std::panic::AssertUnwindSafe;
 
-        // Render terminal inside catch_unwind so a panic in the renderer doesn't kill the worker.
+        // Render terminal + extract links inside catch_unwind so a panic in the renderer doesn't kill the worker.
         // SAFETY: PulldownEngine holds only plain config flags (no interior mutability). AssertUnwindSafe is correct here. Revisit if a stateful engine is ever added.
-        let rendered = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            terminal_engine.render_terminal(&markdown, col_width)
+        let (rendered, link_index) = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            terminal_engine.render_terminal_with_links(&markdown, col_width)
         })) {
             Ok(t) => t,
             Err(_) => {
                 tracing::error!(
                     "preview worker: terminal renderer panicked for revision {revision}"
                 );
-                error_text("Preview renderer panicked. Please check logs for details.")
+                (
+                    error_text("Preview renderer panicked. Please check logs for details."),
+                    LinkIndex::new(),
+                )
             }
         };
 
@@ -218,6 +229,7 @@ fn worker_loop(
                 revision,
                 rendered,
                 html,
+                link_index,
             })
             .is_err()
         {
@@ -381,6 +393,57 @@ mod tests {
             "html field should contain h1 tag: {:?}",
             result.html
         );
+    }
+
+    #[test]
+    fn link_index_populated_from_worker() {
+        let (tx, rx, _handle) = spawn_worker(30, default_extensions());
+
+        tx.try_send(RenderRequest {
+            revision: 1,
+            markdown: "# Intro\n\nSee [Example](https://example.com) for more.\n".to_owned(),
+            col_width: 80,
+        })
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let result = rx.try_recv().expect("expected a result");
+
+        // Should have at least: the heading anchor + the external link
+        let external_count = result
+            .link_index
+            .0
+            .iter()
+            .filter(|l| matches!(&l.target, alloy_core::links::LinkTarget::External(_)))
+            .count();
+
+        assert_eq!(external_count, 1, "expected 1 external link in index");
+    }
+
+    #[test]
+    fn link_index_empty_for_plain_text() {
+        let (tx, rx, _handle) = spawn_worker(30, default_extensions());
+
+        tx.try_send(RenderRequest {
+            revision: 1,
+            markdown: "Just plain text, no links.\n".to_owned(),
+            col_width: 80,
+        })
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let result = rx.try_recv().expect("expected a result");
+
+        let external_count = result
+            .link_index
+            .0
+            .iter()
+            .filter(|l| matches!(&l.target, alloy_core::links::LinkTarget::External(_)))
+            .count();
+
+        assert_eq!(external_count, 0);
     }
 
     /// Verify the debounce actually coalesces rapid requests - if we send N requests quickly, we should receive far fewer than N results (ideally 1).
