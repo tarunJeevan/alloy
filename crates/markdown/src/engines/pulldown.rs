@@ -11,6 +11,15 @@
 //! Nesting:
 //!
 //! Block-quote depth and list indent depth are tracked on small stacks. Malformed nesting (e.g. an `End` without a matching `Start`) is logged as a `tracing::warn!` rather than causing a panic.
+//!
+//! Link extraction:
+//!
+//! Links are accumulated in `RenderContext::link_index`. The index is populated during event dispatch:
+//! - `Start(Tag::Link { dest_url, .. })` stashes the URL and records the current source position.
+//! - Subsequent Text events inside the link accumulate `pending_link_text`.
+//! - `End(TagEnd::Link)` finalizes and pushes the `Link` entry.
+//! - `Start(Tag::Heading)` + `End(TagEnd::Heading)` record an `InternalAnchor` target.
+//! - `[[wiki]]` / `[[wiki|title]]` patterns in raw Text events are parsed and pushed as `WikiLink` entries.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -18,6 +27,8 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 use tracing::warn;
+
+use alloy_core::links::{Link, LinkIndex, LinkTarget, normalize_anchor};
 
 use crate::engine::MarkdownEngine;
 
@@ -32,6 +43,7 @@ use crate::engine::MarkdownEngine;
 pub struct EngineExtensions {
     pub gfm: bool,
     pub footnotes: bool,
+    pub wiki_links: bool,
 }
 
 impl EngineExtensions {
@@ -77,16 +89,23 @@ impl PulldownEngine {
         Self::new(EngineExtensions {
             gfm: true,
             footnotes: false,
+            wiki_links: false,
         })
     }
 }
 
 impl MarkdownEngine for PulldownEngine {
     fn render_terminal(&self, src: &str, col_width: u16) -> Text<'static> {
+        let (text, _) = self.render_terminal_with_links(src, col_width);
+
+        text
+    }
+
+    fn render_terminal_with_links(&self, src: &str, col_width: u16) -> (Text<'static>, LinkIndex) {
         let opts = self.extensions.to_pulldown_options();
         let parser = Parser::new_ext(src, opts);
 
-        render_events(parser, col_width)
+        render_events(parser, col_width, self.extensions.wiki_links)
     }
 
     /// HTML output is deferred to Phase 4 (comrak integration).
@@ -103,14 +122,15 @@ impl MarkdownEngine for PulldownEngine {
 // Core rendering logic
 // -----------------------------------------------------------
 
-/// Converts a `pulldown-cmark` event iterator into `ratatui::text::Text`.
+/// Converts a `pulldown-cmark` event iterator into `(ratatui::text::Text, LinkIndex)`.
 ///
 /// This function is deliberately standalone (not a method) so it can be unit-tested with arbitrary event iterators constructing a `PulldownEngine`.
 pub(crate) fn render_events<'a>(
     events: impl Iterator<Item = Event<'a>>,
     col_width: u16,
-) -> Text<'static> {
-    let mut ctx = RenderContext::new(col_width);
+    wiki_links: bool,
+) -> (Text<'static>, LinkIndex) {
+    let mut ctx = RenderContext::new(col_width, wiki_links);
 
     for event in events {
         ctx.handle_event(event);
@@ -119,7 +139,7 @@ pub(crate) fn render_events<'a>(
     // Flush any trailing content taht didn't end with an explicit block end.
     ctx.flush_line();
 
-    Text::from(ctx.lines)
+    (Text::from(ctx.lines), ctx.link_index)
 }
 
 // -----------------------------------------------------------
@@ -160,6 +180,34 @@ struct RenderContext {
     /// Accumulated item counter for the current ordered list level.
     /// Reset when entering a new list. Incremented on each `Item` open.
     ordered_item_num: Vec<u64>,
+
+    /// Accumulated links discovered during this render pass.
+    link_index: LinkIndex,
+
+    /// The URL/href of the link currently being rendered (set on `Start(Tag::Link)`).
+    pending_link_href: Option<String>,
+
+    /// Text accumulated within the current link (reset on `Start(Tag::Link)`).
+    pending_link_text: String,
+
+    /// The source line at the time we opened the current link.
+    pending_link_source_line: usize,
+
+    /// The source column at the time we opened the current link.
+    pending_link_source_col: usize,
+
+    /// Whether we are currently inside a heading element.
+    in_heading: bool,
+
+    /// Text accumulated within the current heading (used to derive the anchor ID).
+    pending_heading_text: String,
+
+    /// `true` if the engine should scan raw `Text` events for `[[wiki]]` patterns.
+    wiki_links_enabled: bool,
+
+    /// Accumulates raw text content within the current paragraph for wiki link scanning.
+    /// Only used when `wiki_links_enabled` is true. Cleared on paragraph end.
+    paragraph_accumulator: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +217,7 @@ enum ListKind {
 }
 
 impl RenderContext {
-    fn new(col_width: u16) -> Self {
+    fn new(col_width: u16, wiki_links_enabled: bool) -> Self {
         Self {
             lines: Vec::new(),
             current_spans: Vec::new(),
@@ -181,6 +229,15 @@ impl RenderContext {
             code_block_lang: None,
             col_width,
             ordered_item_num: Vec::new(),
+            link_index: LinkIndex::new(),
+            pending_link_href: None,
+            pending_link_text: String::new(),
+            pending_link_source_line: 0,
+            pending_link_source_col: 0,
+            in_heading: false,
+            pending_heading_text: String::new(),
+            wiki_links_enabled,
+            paragraph_accumulator: String::new(),
         }
     }
 
@@ -316,21 +373,93 @@ impl RenderContext {
         self.blank_line();
     }
 
+    /// Current source position (approximated by line count so far).
+    fn current_source_line(&self) -> usize {
+        // We use the number of flushed lines as a proxy for source position.
+        // This is an approximation - rendered lines may differ from source lines due to wrapping, blank lines inserted between blocks, etc.
+        // The value is good enough for cursor-jump purposes.
+        self.lines.len()
+    }
+
+    // Link index helpers
+
+    /// Called when we enter a `Tag::Link`. Stashes the URL and resets the pending text accumulator.
+    fn begin_link(&mut self, href: &str) {
+        self.pending_link_href = Some(href.to_owned());
+        self.pending_link_text.clear();
+        self.pending_link_source_line = self.current_source_line();
+        self.pending_link_source_col = 0;
+    }
+
+    /// Called when we exit `TagEnd::Link`. Finalizes and pushes the link.
+    fn end_link(&mut self) {
+        if let Some(href) = self.pending_link_href.take() {
+            let target = LinkTarget::from_href(&href);
+            self.link_index.push(Link {
+                display_text: self.pending_link_text.clone(),
+                target,
+                source_line: self.pending_link_source_line,
+                source_col: self.pending_link_source_col,
+            });
+        }
+        self.pending_link_text.clear();
+    }
+
+    /// Called when we exit a heading. Registers the heading text as an anchor target.
+    fn end_heading(&mut self) {
+        let anchor = normalize_anchor(&self.pending_heading_text);
+        if !anchor.is_empty() {
+            self.link_index.push(Link {
+                display_text: self.pending_heading_text.clone(),
+                target: LinkTarget::InternalAnchor(anchor),
+                source_line: self.current_source_line().saturating_sub(1),
+                source_col: 0,
+            });
+        }
+        self.pending_heading_text.clear();
+    }
+
+    /// Scan a raw text fragment for `[[wiki]]` or `[[wiki|title]]` patterns and push `WikiLink` entries into the index.
+    fn scan_wiki_links(&mut self, text: &str) {
+        let mut rest = text;
+        while let Some(open) = rest.find("[[") {
+            rest = &rest[open + 2..];
+            if let Some(close) = rest.find("]]") {
+                let inner = &rest[..close];
+                let (page, _title) = inner.split_once('|').unwrap_or((inner, inner));
+                let page = page.trim().to_owned();
+                if !page.is_empty() {
+                    self.link_index.push(Link {
+                        display_text: inner.to_owned(),
+                        target: LinkTarget::WikiLink(page),
+                        source_line: self.current_source_line(),
+                        source_col: 0,
+                    });
+                }
+                rest = &rest[close + 2..];
+            } else {
+                break;
+            }
+        }
+    }
+
     // Event dispatch
 
     fn handle_event(&mut self, event: Event<'_>) {
         match event {
             // Text content
             Event::Text(text) => {
+                let s = text.as_ref();
+
                 if self.in_code_block {
                     // Each line of a code block arrives as a separate Text event terminated by '\n'.
                     // Split and emit individual lines.
                     let code_style = Style::default().fg(Color::White).bg(Color::Reset);
-                    let content = text.as_ref();
+                    let content = s;
                     let lines: Vec<&str> = content.split('\n').collect();
                     for (i, line) in lines.iter().enumerate() {
                         self.current_spans
-                            .push(Span::styled(format!("	{line}"), code_style));
+                            .push(Span::styled(format!("\t{line}"), code_style));
 
                         // Flush between lines but not after the last fragment (the trailing '\n' produces an empty final element).
                         if i < lines.len().saturating_sub(1) {
@@ -341,6 +470,17 @@ impl RenderContext {
                         }
                     }
                 } else {
+                    // Accumulate text for heading anchor and link display text.
+                    if self.in_heading {
+                        self.pending_heading_text.push_str(s);
+                    }
+                    if self.pending_link_href.is_some() {
+                        self.pending_link_text.push_str(s);
+                    }
+                    // Accumulate for wiki link scanning (scanned in bulk on End(Paragraph)).
+                    if self.wiki_links_enabled {
+                        self.paragraph_accumulator.push_str(s);
+                    }
                     self.push_text(text.into_string());
                 }
             }
@@ -399,6 +539,8 @@ impl RenderContext {
                 let (prefix, style) = heading_style(level);
                 self.block_prefix = Some(prefix);
                 self.push_style(|_| style);
+                self.in_heading = true;
+                self.pending_heading_text.clear();
             }
 
             // Paragraph
@@ -513,12 +655,9 @@ impl RenderContext {
             }
 
             // Links - display the link text as a dim note inline.
-            // NOTE: Full link handling comes in Phase 6.
             Tag::Link { dest_url, .. } => {
+                self.begin_link(dest_url.as_ref());
                 self.push_style(|s| s.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED));
-                // Stash the URL so we can emit it after the link text on End.
-                // We encode it into a synthetic span at End time. For now we just track it via a style annotation.
-                let _ = dest_url; // NOTE: Phase 6 will use this
             }
 
             Tag::Image { .. } => {
@@ -535,6 +674,8 @@ impl RenderContext {
         match tag {
             // Headings
             TagEnd::Heading(_) => {
+                self.in_heading = false;
+                self.end_heading();
                 self.flush_line();
                 self.pop_style();
                 self.blank_line();
@@ -544,6 +685,11 @@ impl RenderContext {
             TagEnd::Paragraph => {
                 self.flush_line();
                 self.blank_line();
+                if self.wiki_links_enabled && !self.paragraph_accumulator.is_empty() {
+                    let accumulated = std::mem::take(&mut self.paragraph_accumulator);
+                    self.scan_wiki_links(&accumulated);
+                }
+                self.paragraph_accumulator.clear(); // no-op if take() was used but better to be safe
             }
 
             // BlockQuote
@@ -612,6 +758,7 @@ impl RenderContext {
             }
 
             TagEnd::Link => {
+                self.end_link();
                 self.pop_style();
             }
 
@@ -745,6 +892,13 @@ mod tests {
         let text = engine.render_terminal(src, 80);
 
         text_to_plain(&text)
+    }
+
+    fn render_with_links(src: &str) -> (String, LinkIndex) {
+        let engine = PulldownEngine::with_gfm();
+        let (text, links) = engine.render_terminal_with_links(src, 80);
+
+        (text_to_plain(&text), links)
     }
 
     /// Flatten `Text` to a plain string (content only, no styles) for snapshot-friendly assertions.
@@ -1002,6 +1156,144 @@ mod tests {
         let lines = wrap_line(spans, 0);
 
         assert!(!lines.is_empty());
+    }
+
+    // Link extraction tests
+
+    #[test]
+    fn inline_link_extracted_correctly() {
+        let (_, links) = render_with_links("[Example](https://example.com)\n");
+
+        assert_eq!(links.len(), 1);
+
+        let link = links.get(0).unwrap();
+
+        assert_eq!(link.display_text, "Example");
+        assert!(matches!(&link.target, LinkTarget::External(u) if u == "https://example.com"));
+    }
+
+    #[test]
+    fn internal_anchor_link_extracted() {
+        let (_, links) = render_with_links("[Go to section](#my-section)\n");
+
+        // Should have both the link and the anchor (if heading exists) — we're only checking the link here
+        let anchor_link = links
+            .0
+            .iter()
+            .find(|l| matches!(&l.target, LinkTarget::InternalAnchor(a) if a == "my-section"));
+
+        assert!(anchor_link.is_some(), "internal anchor link not found");
+    }
+
+    #[test]
+    fn heading_registers_as_anchor_target() {
+        let (_, links) = render_with_links("# My Heading\n\nSome text.\n");
+
+        let anchor = links
+            .0
+            .iter()
+            .find(|l| matches!(&l.target, LinkTarget::InternalAnchor(a) if a == "my-heading"));
+
+        assert!(anchor.is_some(), "heading anchor not registered: {links:?}");
+    }
+
+    #[test]
+    fn multiple_links_all_extracted() {
+        let src = "[One](https://one.com) and [Two](https://two.com)\n";
+        let (_, links) = render_with_links(src);
+
+        let externals: Vec<_> = links
+            .0
+            .iter()
+            .filter(|l| matches!(&l.target, LinkTarget::External(_)))
+            .collect();
+
+        assert_eq!(externals.len(), 2, "expected 2 external links: {links:?}");
+    }
+
+    #[test]
+    fn no_links_in_plain_paragraph() {
+        let (_, links) = render_with_links("Just plain text, no links here.\n");
+        let external_count = links
+            .0
+            .iter()
+            .filter(|l| matches!(&l.target, LinkTarget::External(_)))
+            .count();
+
+        assert_eq!(external_count, 0);
+    }
+
+    #[test]
+    fn file_path_link_classified_correctly() {
+        let (_, links) = render_with_links("[Notes](./notes.md)\n");
+
+        let file_link = links
+            .0
+            .iter()
+            .find(|l| matches!(&l.target, LinkTarget::FilePath(_)));
+
+        assert!(file_link.is_some(), "file path link not found: {links:?}");
+    }
+
+    #[test]
+    fn wiki_link_extracted_when_enabled() {
+        let engine = PulldownEngine::new(EngineExtensions {
+            gfm: true,
+            footnotes: false,
+            wiki_links: true,
+        });
+        let (_, links) = engine.render_terminal_with_links("See [[HomePage]] for details.\n", 80);
+
+        let wiki = links
+            .0
+            .iter()
+            .find(|l| matches!(&l.target, LinkTarget::WikiLink(p) if p == "HomePage"));
+
+        assert!(wiki.is_some(), "wiki link not extracted: {links:?}");
+    }
+
+    #[test]
+    fn wiki_link_with_title_extracted() {
+        let engine = PulldownEngine::new(EngineExtensions {
+            gfm: true,
+            footnotes: false,
+            wiki_links: true,
+        });
+        let (_, links) = engine.render_terminal_with_links("[[MyPage|Custom Title]]\n", 80);
+
+        let wiki = links
+            .0
+            .iter()
+            .find(|l| matches!(&l.target, LinkTarget::WikiLink(p) if p == "MyPage"));
+
+        assert!(
+            wiki.is_some(),
+            "wiki link with title not extracted: {links:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_links_not_extracted_when_disabled() {
+        let engine = PulldownEngine::with_gfm(); // wiki_links = false
+        let (_, links) = engine.render_terminal_with_links("See [[HomePage]] for details.\n", 80);
+
+        let wiki_count = links
+            .0
+            .iter()
+            .filter(|l| matches!(&l.target, LinkTarget::WikiLink(_)))
+            .count();
+
+        assert_eq!(
+            wiki_count, 0,
+            "wiki links should not be extracted when disabled"
+        );
+    }
+
+    #[test]
+    fn link_display_text_captured() {
+        let (_, links) = render_with_links("[Click Here](https://example.com)\n");
+
+        assert_eq!(links.get(0).unwrap().display_text, "Click Here");
     }
 
     // Insta snapshot tests
