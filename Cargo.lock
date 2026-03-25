@@ -50,6 +50,7 @@ dependencies = [
  "regex",
  "scopeguard",
  "serde",
+ "supports-hyperlinks",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -1236,6 +1237,12 @@ dependencies = [
  "rustversion",
  "syn",
 ]
+
+[[package]]
+name = "supports-hyperlinks"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e396b6523b11ccb83120b115a0b7366de372751aa6edf19844dfb13a6af97e91"
 
 [[package]]
 name = "syn"

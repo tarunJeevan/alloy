@@ -31,6 +31,7 @@ use ratatui::{
     style::{Color, Style},
     text::Text,
 };
+use supports_hyperlinks::supports_hyperlinks;
 use tui_textarea::{CursorMove, TextArea};
 
 use alloy_core::{
@@ -138,6 +139,9 @@ pub struct App {
     /// 0-indexed cursor into `link_index`. Wraps at both ends in `LinkSelect` mode.
     pub link_cursor: usize,
 
+    /// Confirms the running terminal supports OSC-9 hyperlinks.
+    pub hyperlinks_supported: bool,
+
     // Preview state
     /// Which preview mode is currently active.
     pub preview_mode: PreviewMode,
@@ -219,6 +223,9 @@ impl App {
             math: config.markdown.extensions.math,
         };
 
+        // Check whether the terminal supports hyperlinks.
+        let hyperlinks_supported = supports_hyperlinks();
+
         // Spawn the background render thread.
         let (request_sender, result_receiver, worker_handle) =
             spawn_worker(debounce_ms, extensions);
@@ -236,6 +243,7 @@ impl App {
             search_saved_cursor: (0, 0),
             link_index: LinkIndex::new(),
             link_cursor: 0,
+            hyperlinks_supported,
             preview_mode: PreviewMode::Rendered,
             preview_scroll: 0,
             preview_scroll_html: 0,
@@ -950,6 +958,22 @@ impl App {
             "0/0".to_owned()
         } else {
             format!("{}/{}", self.link_cursor + 1, self.link_index.len())
+        }
+    }
+
+    /// Returns `true` when OSC-8 hyperlinks should be emitted in the preview pane.
+    ///
+    /// Controlled by `[terminal] hyperlinks` in user config:
+    /// - "off" -> always false
+    /// - "on" -> always true
+    /// - "auto" -> mirrors the startup detection result
+    pub fn hyperlinks_enabled(&self) -> bool {
+        use alloy_core::config::HyperlinksMode;
+
+        match self.config.terminal.hyperlinks {
+            HyperlinksMode::On => true,
+            HyperlinksMode::Off => false,
+            HyperlinksMode::Auto => self.hyperlinks_supported,
         }
     }
 }
