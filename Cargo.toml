@@ -1,11 +1,10 @@
 [workspace]
-members = ["crates/app", "crates/core", "crates/markdown"]
 resolver = "2"
+members = ["crates/app", "crates/core", "crates/markdown"]
 
 [workspace.dependencies]
 # TUI + terminal
-ratatui = "0.29.0"
-crossterm = "0.28.1"
+ratatui = "0.30.0"
 
 # Error handling
 anyhow = "1.0.102"
