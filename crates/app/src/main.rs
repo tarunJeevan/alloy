@@ -13,6 +13,8 @@
 
 mod app;
 mod cli;
+mod image_cache;
+mod image_proto;
 mod keymap;
 mod preview_worker;
 mod ui;
@@ -20,16 +22,20 @@ mod ui;
 use std::{io, time::Duration};
 
 use anyhow::{Context, Result};
-use crossterm::{
-    event::{self, Event, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    crossterm::{
+        event::{self, Event, KeyEventKind},
+        execute,
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
 
 use alloy_core::{config::Config, document::Document};
 use app::App;
 use cli::CliArgs;
+use image_proto::DetectedImageProtocol;
 
 // Terminal lifecycle
 
@@ -69,8 +75,24 @@ fn main() -> Result<()> {
         None => Document::new(),
     };
 
+    // Detect image protocols supported by the terminal and use the most suitable one.
+    let detected_image_protocol = {
+        if !config.images.enabled
+            || config.images.protocol == alloy_core::config::ImageProtocol::Off
+        {
+            // Detection disabled by config.
+            tracing::debug!("image: protocol detection skipped (disabled in config)");
+            DetectedImageProtocol::None
+        } else {
+            // Attempt full ratatui-image Picker detection with a timeout.
+            detect_protocol_with_timeout(Duration::from_millis(200))
+        }
+    };
+
+    tracing::debug!(protocol = ?detected_image_protocol, "image protocol detection complete");
+
     // Build app - initialize app state with config and opened document
-    let mut app = App::new(config, document);
+    let mut app = App::new(config, document, detected_image_protocol);
 
     // Terminal setup - enable raw mode and enter alt screen
     enable_raw_mode().context("failed to enable raw mode")?;
@@ -93,6 +115,71 @@ fn main() -> Result<()> {
     // Clean exit - restore terminal before returning
     restore_terminal();
     result
+}
+
+// ------------------------------------------------------------
+// Config-level gating
+// ------------------------------------------------------------
+
+/// Attempt image protocol detection via `ratatui-image`'s Picker, with a thread + timeout guard.
+///
+/// On success, maps the detected `Picker` into our `DetectedImageProtocol` enum.
+/// On timeout or error (common in tmux, screen), falls back to env-var heuristics.
+fn detect_protocol_with_timeout(timeout: Duration) -> image_proto::DetectedImageProtocol {
+    use image_proto::detect_from_env;
+    use ratatui_image::picker::Picker;
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<Result<DetectedImageProtocol, String>>();
+
+    // Run 'Picker::from_query_stdio()' on a dedicated thread so we can enforce a timeout.
+    // The thread sends its result back via the channel.
+    std::thread::spawn(move || {
+        let result = match Picker::from_query_stdio() {
+            Ok(picker) => {
+                // Map ratatui-image's protocol type to our enum.
+                let proto = map_picker_protocol(&picker);
+                tracing::debug!(?proto, "ratatui-image picker detection succeeded");
+                Ok(proto)
+            }
+            Err(e) => {
+                tracing::debug!("ratatui-image picker detection failed: {e}");
+                Err(e.to_string())
+            }
+        };
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(proto)) => proto,
+        Ok(Err(_picker_err)) => {
+            // Picker query failed - fall back to env-var heuristics.
+            tracing::debug!("picker failed; falling back to env-var detection");
+            detect_from_env()
+        }
+        Err(_timeout) => {
+            // Timed out (likely tmux/screen) - fall back to env-var heuristics.
+            tracing::warn!(
+                "image protocol detection timed out after {}ms; using env-var heuristics",
+                timeout.as_millis()
+            );
+            detect_from_env()
+        }
+    }
+}
+
+/// Map a ratatui-image Picker's detected protocol to our DetectedImageProtocol.
+fn map_picker_protocol(
+    picker: &ratatui_image::picker::Picker,
+) -> image_proto::DetectedImageProtocol {
+    use ratatui_image::picker::ProtocolType;
+
+    // Picker::protocol() returns the detected Protocol variant.
+    match picker.protocol_type() {
+        ProtocolType::Kitty => DetectedImageProtocol::Kitty,
+        ProtocolType::Halfblocks => DetectedImageProtocol::HalfBlock,
+        _ => DetectedImageProtocol::HalfBlock,
+    }
 }
 
 fn run_event_loop(
@@ -122,7 +209,8 @@ fn run_event_loop(
                 }
                 Event::Resize(_, _) => {
                     // Ratatui redraws on the next frame automatically.
-                    // NOTE: col_width will be properly threaded in Chunk 3.2 when we pass the actual frame dimensions into `send_render_request()`.
+                    // Invalidate image cache on resize so images are re-encoded at the new cell dimensions on the next render.
+                    app.on_resize();
                 }
                 _ => {}
             }
