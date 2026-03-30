@@ -20,6 +20,13 @@
 //! - `End(TagEnd::Link)` finalizes and pushes the `Link` entry.
 //! - `Start(Tag::Heading)` + `End(TagEnd::Heading)` record an `InternalAnchor` target.
 //! - `[[wiki]]` / `[[wiki|title]]` patterns in raw Text events are parsed and pushed as `WikiLink` entries.
+//!
+//! Image handling:
+//!
+//! Images use `ratatui-image` widgets for protocol-based rendering with a placeholder path as a fallback for:
+//! - when images are disabled
+//! - the protocol is unsupported
+//! - the image fails to load
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -112,7 +119,7 @@ impl MarkdownEngine for PulldownEngine {
     ///
     /// Returns a plain-text fallback so callers always get a `String`.
     fn render_html(&self, src: &str) -> String {
-        // Phase 4 will replace this with comrak::markdown_to_html.
+        // NOTE: Replace this with comrak::markdown_to_html.
         // For now return the source wrapped in a <pre> so the HTML preview pane at least shows something useful.
         format!("<pre>\n{src}\n</pre>")
     }
@@ -208,6 +215,20 @@ struct RenderContext {
     /// Accumulates raw text content within the current paragraph for wiki link scanning.
     /// Only used when `wiki_links_enabled` is true. Cleared on paragraph end.
     paragraph_accumulator: String,
+
+    /// `true` while inside an image tag.
+    ///
+    /// Used to suppress normal Text event processing inside the image so that alt text is captured into `pending_image_alt` rather than emitted as visible spans.
+    in_image: bool,
+
+    /// The URL/path of the image currently being rendered.
+    /// Set on `Start(Tag::Image)` and cleared on `End(TagEnd::Image)`.
+    pending_image_url: String,
+
+    /// Alt text accumulated from `Text` events inside the image tag.
+    /// pulldown-cmark emits the alt text as one or more Text events between `Start(Tag::Image)` and `End(TagEng::Image)`.
+    /// Cleared on `End(TagEnd::Image)`.
+    pending_image_alt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +259,9 @@ impl RenderContext {
             pending_heading_text: String::new(),
             wiki_links_enabled,
             paragraph_accumulator: String::new(),
+            in_image: false,
+            pending_image_url: String::new(),
+            pending_image_alt: String::new(),
         }
     }
 
@@ -443,6 +467,50 @@ impl RenderContext {
         }
     }
 
+    // Image helpers
+
+    /// Called on `Start(Tag::Image { dest_url, .. })`.
+    ///
+    /// Records the image URL and switches into image-accumulation mode.
+    /// While `in_image` is true, Text events are captured into `pending_image_alt` rather than emitted as visible spans.
+    fn begin_image(&mut self, url: &str) {
+        self.in_image = true;
+        self.pending_image_url = url.to_owned();
+        self.pending_image_alt.clear();
+    }
+
+    /// Called on `End(TagEnd::Image)`.
+    ///
+    /// Emits a styled placeholder span and resets image state.
+    ///
+    /// Placeholder format:
+    /// - With alt text: `[Image: alt text (url)]`
+    /// - Without alt text: `[Image: url]`
+    fn end_image(&mut self) {
+        let label = if self.pending_image_alt.trim().is_empty() {
+            // No alt text - just show the URL
+            format!("[Image: {}]", self.pending_image_url)
+        } else {
+            format!(
+                "[Image: {} ({})]",
+                self.pending_image_alt.trim(),
+                self.pending_image_url
+            )
+        };
+
+        self.current_spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::DIM),
+        ));
+
+        // Reset image state
+        self.in_image = false;
+        self.pending_image_url.clear();
+        self.pending_image_alt.clear();
+    }
+
     // Event dispatch
 
     fn handle_event(&mut self, event: Event<'_>) {
@@ -469,6 +537,9 @@ impl RenderContext {
                             }
                         }
                     }
+                } else if self.in_image {
+                    // Alt text inside an image tag - accumulate, don't emit.
+                    self.pending_image_alt.push_str(s);
                 } else {
                     // Accumulate text for heading anchor and link display text.
                     if self.in_heading {
@@ -660,9 +731,8 @@ impl RenderContext {
                 self.push_style(|s| s.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED));
             }
 
-            Tag::Image { .. } => {
-                // NOTE: Phase 7 - inline image placeholder.
-                self.push_style(|s| s.fg(Color::Magenta));
+            Tag::Image { dest_url, .. } => {
+                self.begin_image(dest_url.as_ref());
             }
 
             // Ignore meta-tags not relevant for terminal rendering.
@@ -763,7 +833,7 @@ impl RenderContext {
             }
 
             TagEnd::Image => {
-                self.pop_style();
+                self.end_image();
             }
 
             _ => {}
@@ -1038,6 +1108,100 @@ mod tests {
         let out = render("~~gone~~\n");
 
         assert!(out.contains("gone"), "strikethrough text missing: {out:?}");
+    }
+
+    // Image checks
+
+    #[test]
+    fn image_with_alt_text_renders_placeholder() {
+        let out = render("![A cat sitting](cat.png)\n");
+
+        assert!(
+            out.contains("[Image:"),
+            "image placeholder prefix missing: {out:?}"
+        );
+        assert!(
+            out.contains("A cat sitting"),
+            "image alt text missing from placeholder: {out:?}"
+        );
+        assert!(
+            out.contains("cat.png"),
+            "image URL missing from placeholder: {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_without_alt_text_renders_url_only() {
+        let out = render("![](diagram.svg)\n");
+
+        assert!(
+            out.contains("[Image: diagram.svg]"),
+            "expected bare URL placeholder for no-alt image: {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_with_remote_url_renders_placeholder() {
+        let out = render("![Logo](https://example.com/logo.png)\n");
+
+        assert!(
+            out.contains("https://example.com/logo.png"),
+            "remote URL missing from placeholder: {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_alt_text_not_emitted_as_visible_text() {
+        // The alt text should appear only inside the [Image: ...] placeholder, not
+        // as a separate run of text.
+        let out = render("![Secret Alt](img.png)\n");
+
+        // Should contain exactly one occurrence of "Secret Alt" (inside the placeholder).
+        let count = out.matches("Secret Alt").count();
+
+        assert_eq!(count, 1, "alt text should appear exactly once: {out:?}");
+    }
+
+    #[test]
+    fn image_span_has_magenta_style() {
+        let engine = PulldownEngine::with_gfm();
+        let text = engine.render_terminal("![Alt](img.png)\n", 80);
+
+        let image_span = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("[Image:"));
+
+        assert!(image_span.is_some(), "image placeholder span not found");
+        assert_eq!(
+            image_span.unwrap().style.fg,
+            Some(Color::Magenta),
+            "image placeholder should have Magenta fg"
+        );
+    }
+
+    #[test]
+    fn image_does_not_corrupt_surrounding_text() {
+        let out = render("Before.\n\n![Alt](img.png)\n\nAfter.\n");
+
+        assert!(
+            out.contains("Before."),
+            "text before image missing: {out:?}"
+        );
+        assert!(out.contains("After."), "text after image missing: {out:?}");
+        assert!(
+            out.contains("[Image:"),
+            "image placeholder missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_images_all_rendered_as_placeholders() {
+        let out = render("![One](one.png)\n\n![Two](two.png)\n");
+
+        assert!(out.contains("one.png"), "first image missing: {out:?}");
+        assert!(out.contains("two.png"), "second image missing: {out:?}");
     }
 
     // Style checks (spawn-level)

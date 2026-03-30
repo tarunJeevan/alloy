@@ -26,8 +26,8 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tui_textarea::Input;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui_textarea::Input;
 
 use alloy_core::EditorMode;
 
@@ -37,7 +37,7 @@ use alloy_core::EditorMode;
 
 /// High-level editor actions, fully decoupled from ray key events.
 ///
-/// The event loop matches on these variants to mutate `App` state and drive `tui-textarea`.
+/// The event loop matches on these variants to mutate `App` state and drive `ratatui-textarea`.
 #[derive(Debug, Clone)]
 pub enum EditorAction {
     // Mode transitions
@@ -110,7 +110,7 @@ pub enum EditorAction {
     FollowLink,
 
     // Insert-mode passthrough
-    /// A key that should be forwarded verbatim to `tui-textarea::TextArea::input`
+    /// A key that should be forwarded verbatim to `ratatui-textarea::TextArea::input`
     TextInput(Input),
 
     // Command-mode actions
@@ -576,7 +576,7 @@ impl KeymapDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     // Helpers
 

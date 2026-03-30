@@ -13,7 +13,7 @@
 //!
 //! Architecture note: live buffer vs persistence layer
 //!
-//! `tui-textarea`'s `TextArea` is the live edit buffer - it's the authoritative source for the text the user is currently editing and owns undo/redo history.
+//! `ratatui-textarea`'s `TextArea` is the live edit buffer - it's the authoritative source for the text the user is currently editing and owns undo/redo history.
 //!
 //! `Document` is the persistence layer - it tracks the on-disk path, modified state, and last-saved content (as a `Rope`).
 //! It is NOT kept in sync with every keystroke; sync only happens at:
@@ -21,18 +21,20 @@
 //! - save: `TextArea::lines().join("\n")` -> `Document::save()`
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{Receiver, SyncSender},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::KeyEvent;
-use ratatui::style::Modifier;
 use ratatui::{
-    style::{Color, Style},
+    crossterm::event::KeyEvent,
+    style::{Color, Modifier, Style},
     text::Text,
 };
-use supports_hyperlinks::supports_hyperlinks;
-use tui_textarea::{CursorMove, TextArea};
+use ratatui_image::picker::Picker;
+use ratatui_textarea::{CursorMove, TextArea};
 
 use alloy_core::{
     EditorMode,
@@ -42,6 +44,8 @@ use alloy_core::{
     search::{LARGE_DOC_THRESHOLD_BYTES, SearchKind, SearchState},
 };
 
+use crate::image_cache::ImageCache;
+use crate::image_proto::DetectedImageProtocol;
 use crate::keymap::{EditorAction, KeymapDispatcher};
 use crate::preview_worker::{RenderRequest, RenderResult, WorkerExtensions, spawn_worker};
 
@@ -142,6 +146,17 @@ pub struct App {
     /// Confirms the running terminal supports OSC-9 hyperlinks.
     pub hyperlinks_supported: bool,
 
+    // Image state
+    /// Image protocol detected from terminal at startup.
+    pub detected_image_protocol: DetectedImageProtocol,
+
+    /// ratatui-image Picker for protocol-specific image encoding.
+    /// `None` when images are disabled or `DetectedImageProtocol::None`.
+    pub picker: Option<Arc<Mutex<Picker>>>,
+
+    /// LRU cache of decoded + protocol-encoded images. Shared with the preview worker.
+    pub image_cache: Arc<Mutex<ImageCache>>,
+
     // Preview state
     /// Which preview mode is currently active.
     pub preview_mode: PreviewMode,
@@ -186,7 +201,11 @@ impl App {
     /// Construct a new `App` from a loaded config and document.
     ///
     /// Seeds the `TextArea` from `document.content()` and applies initial styling from config.
-    pub fn new(config: Config, document: Document) -> Self {
+    pub fn new(
+        config: Config,
+        document: Document,
+        detected_image_protocol: DetectedImageProtocol,
+    ) -> Self {
         let content = document.content();
 
         // `TextArea::new()` accepts `Vec<String>` lines. Split on '\n'.
@@ -224,7 +243,14 @@ impl App {
         };
 
         // Check whether the terminal supports hyperlinks.
-        let hyperlinks_supported = supports_hyperlinks();
+        let hyperlinks_supported = supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr);
+
+        // Build Picker if a usable protocol is detected.
+        let picker: Option<Arc<Mutex<Picker>>> = match &detected_image_protocol {
+            DetectedImageProtocol::None => None,
+            _ => Some(Arc::new(Mutex::new(Picker::halfblocks()))),
+        };
+        let image_cache = Arc::new(Mutex::new(ImageCache::new(20)));
 
         // Spawn the background render thread.
         let (request_sender, result_receiver, worker_handle) =
@@ -244,6 +270,9 @@ impl App {
             link_index: LinkIndex::new(),
             link_cursor: 0,
             hyperlinks_supported,
+            detected_image_protocol,
+            picker,
+            image_cache,
             preview_mode: PreviewMode::Rendered,
             preview_scroll: 0,
             preview_scroll_html: 0,
@@ -258,6 +287,21 @@ impl App {
 
         // Populate the initial preview.
         app.send_render_request();
+
+        // First run notification about image protocol support.
+        if app.detected_image_protocol.is_graphics_capable() {
+            app.notify_info(format!(
+                "Image rendering: {} protocol active",
+                app.detected_image_protocol.label()
+            ));
+        } else if app.config.images.enabled
+            && app.detected_image_protocol == DetectedImageProtocol::HalfBlock
+        {
+            // HalfBlock is always available and is a silent fallback.
+            // Only log at debug level to avoid cluttering UI.
+            tracing::debug!("image: no graphics protocol detected; using halfblock fallback");
+        }
+
         app
     }
 
@@ -976,6 +1020,24 @@ impl App {
             HyperlinksMode::Auto => self.hyperlinks_supported,
         }
     }
+
+    // -----------------------------------------------------------
+    // Image helpers
+    // -----------------------------------------------------------
+
+    /// Returns `true` when image rendering is enabled AND a supported protocol is available.
+    pub fn images_enabled(&self) -> bool {
+        self.config.images.enabled
+            && self.detected_image_protocol != DetectedImageProtocol::None
+            && self.picker.is_some()
+    }
+
+    /// Invalidate image cache on terminal resize.
+    pub fn on_resize(&mut self) {
+        if let Ok(mut cache) = self.image_cache.lock() {
+            cache.invalidate_all();
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1067,7 +1129,11 @@ mod tests {
     // App command execution (uses Document::new() so no disk I/O)
 
     fn make_app() -> App {
-        App::new(Config::default(), Document::new())
+        App::new(
+            Config::default(),
+            Document::new(),
+            DetectedImageProtocol::None,
+        )
     }
 
     // Preview mode actions
@@ -1667,7 +1733,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let doc = Document::open(&path).expect("open temp file");
-        let mut app = App::new(Config::default(), doc);
+        let mut app = App::new(Config::default(), doc, DetectedImageProtocol::None);
 
         app.execute_command(&format!("wq"));
 
