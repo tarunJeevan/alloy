@@ -41,6 +41,7 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     pub ui: UiConfig,
     pub terminal: TerminalConfig,
+    pub images: ImagesConfig,
 }
 
 /// The config schema version written by this build.
@@ -56,6 +57,7 @@ impl Default for Config {
             markdown: MarkdownConfig::default(),
             ui: UiConfig::default(),
             terminal: TerminalConfig::default(),
+            images: ImagesConfig::default(),
         }
     }
 }
@@ -291,6 +293,47 @@ impl Default for TerminalConfig {
     }
 }
 
+// -----------------------------------------------------------------------
+// Images Config
+// -----------------------------------------------------------------------
+
+/// Image settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImagesConfig {
+    /// Enable image rendering in the preview pane.
+    pub enabled: bool,
+
+    /// Which graphics protocol to use.
+    /// "auto" = detect at startup | "kitty" | "iterm2" | "sixel" | "off" = force/disable
+    pub protocol: ImageProtocol,
+
+    /// Allow fetching remote images over HTTP/HTTPS.
+    /// Defaults to false for privacy/security reasons.
+    pub fetch_remote: bool,
+}
+
+impl Default for ImagesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protocol: ImageProtocol::Auto,
+            fetch_remote: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageProtocol {
+    #[default]
+    Auto,
+    Kitty,
+    Iterm2,
+    Sixel,
+    Off,
+}
+
 /// Controls whether OSC-8 terminal hyperlinks are emitted in the preview pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -507,5 +550,43 @@ mod tests {
     #[test]
     fn default_split_ratio_is_50() {
         assert_eq!(Config::default().ui.split_ratio, 50);
+    }
+
+    // ImagesConfig defaults
+
+    #[test]
+    fn default_images_config_enabled_auto_no_remote() {
+        let cfg = ImagesConfig::default();
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.protocol, ImageProtocol::Auto);
+        assert!(!cfg.fetch_remote);
+    }
+
+    #[test]
+    fn images_config_round_trips() {
+        let mut cfg = Config::default();
+        cfg.images.enabled = false;
+        cfg.images.protocol = ImageProtocol::Kitty;
+        cfg.images.fetch_remote = true;
+
+        let toml_str = toml::to_string_pretty(&cfg).expect("serialize failed");
+        let back: Config = toml::from_str(&toml_str).expect("deserialize failed");
+
+        assert!(!back.images.enabled);
+        assert_eq!(back.images.protocol, ImageProtocol::Kitty);
+        assert!(back.images.fetch_remote);
+    }
+
+    #[test]
+    fn images_protocol_off_serializes_correctly() {
+        let mut cfg = Config::default();
+        cfg.images.protocol = ImageProtocol::Off;
+        let toml_str = toml::to_string_pretty(&cfg).expect("serialize failed");
+
+        assert!(
+            toml_str.contains("protocol = \"off\""),
+            "expected 'off' in toml: {toml_str}"
+        );
     }
 }

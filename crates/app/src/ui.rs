@@ -149,7 +149,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 // Preview pane
 // ---------------------------------------------------------------
 
-fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
+fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.preview_mode {
         PreviewMode::Rendered => render_preview_rendered(frame, app, area),
         PreviewMode::Html => render_preview_html(frame, app, area),
@@ -158,8 +158,9 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the terminal-rendered Markdown preview.
-fn render_preview_rendered(frame: &mut Frame, app: &App, area: Rect) {
+fn render_preview_rendered(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = preview_block(" Preview ", Color::DarkGray);
+    let inner = block.inner(area);
 
     // Conditionally inject OSC-8 hyperlinks when the terminal supports them.
     let text = if app.hyperlinks_enabled() {
@@ -173,6 +174,12 @@ fn render_preview_rendered(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((app.preview_scroll, 0));
 
     frame.render_widget(widget, area);
+
+    // Attempt image rendering overlay when images are enabled.
+    // This renders images over the placeholder span lines.
+    if app.images_enabled() {
+        render_preview_images(frame, app, inner);
+    }
 }
 
 /// Render the raw HTML source preview.
@@ -214,6 +221,97 @@ fn preview_block(title: &'static str, border_color: Color) -> Block<'static> {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(title, Style::default().fg(Color::DarkGray)))
+}
+
+/// Render inline images into the preview area by overlaying `StatefulImage` widgets on top of the placeholder spans already drawn by `render_preview_rendered`.
+///
+/// NOTE: This is an intentionally simple image rendering method - "good enough" for MVP. A pixel-accurate layout would require the renderer to emit explicit image placement metadata.
+fn render_preview_images(frame: &mut Frame, app: &mut App, inner: Rect) {
+    use alloy_core::links::LinkTarget;
+    use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+
+    // Collect image URLs from the link index (filtering out heading anchors and regular links).
+    let image_urls: Vec<(usize, String)> = app
+        .link_index
+        .0
+        .iter()
+        .filter_map(|link| {
+            match &link.target {
+                // Local file paths - check file extension for image types.
+                LinkTarget::FilePath(path) => {
+                    let ext = path.extension()?.to_str()?.to_lowercase();
+                    matches!(
+                        ext.as_str(),
+                        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+                    )
+                    .then(|| (link.source_line, path.to_string_lossy().into_owned()))
+                }
+                // External URLs - check extensinon heuristic.
+                LinkTarget::External(url) => {
+                    let lower = url.to_lowercase();
+                    (lower.ends_with(".png")
+                        || lower.ends_with(".jpg")
+                        || lower.ends_with(".jpeg")
+                        || lower.ends_with(".gif")
+                        || lower.ends_with("webp"))
+                    .then(|| (link.source_line, url.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    if image_urls.is_empty() {
+        return;
+    }
+
+    let Some(picker_arc) = &app.picker else {
+        return;
+    };
+    let Ok(mut picker) = picker_arc.lock() else {
+        return;
+    };
+    let Ok(mut cache) = app.image_cache.lock() else {
+        return;
+    };
+
+    let fetch_remote = app.config.images.fetch_remote;
+    let base_dir = app.document.path.as_deref().and_then(|p| p.parent());
+    let scroll = app.preview_scroll as usize;
+
+    for (source_line, url) in &image_urls {
+        // Estimate the rendered row for this image.
+        let row = source_line.saturating_sub(scroll);
+        if row >= inner.height as usize {
+            continue; // Image scrolled off screen
+        }
+
+        // Reserve a rendering area for image.
+        let img_row = (inner.y + row as u16 + 1).min(inner.y + inner.height.saturating_sub(1));
+        let img_height = 8u16.min(inner.y + inner.height - img_row);
+        if img_height == 0 {
+            continue;
+        }
+
+        let img_rect = Rect {
+            x: inner.x,
+            y: img_row,
+            width: inner.width,
+            height: img_height,
+        };
+
+        // Attempt cache lookup + load.
+        if let Err(e) = cache.get_or_load(url, &mut picker, fetch_remote, base_dir) {
+            tracing::debug!(url, error = %e, "image: load failed; using placeholder");
+            continue;
+        }
+
+        // Mutable re-lookup for render_stateful_widget.
+        if let Some(entry) = cache.get_mut(url) {
+            let widget = StatefulImage::<StatefulProtocol>::default();
+            frame.render_stateful_widget(widget, img_rect, &mut entry.protocol);
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -534,6 +632,7 @@ fn inject_osc8(text: Text<'static>, link_index: &LinkIndex) -> Text<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_proto::DetectedImageProtocol;
 
     #[test]
     fn word_count_empty() {
@@ -605,7 +704,11 @@ mod tests {
         use crate::app::App;
         use alloy_core::{config::Config, document::Document};
 
-        let app = App::new(Config::default(), Document::new());
+        let app = App::new(
+            Config::default(),
+            Document::new(),
+            DetectedImageProtocol::Kitty,
+        );
 
         // Simulate a very narrow body rect
         let narrow = Rect::new(0, 0, MIN_SPLIT_WIDTH - 1, 20);
@@ -622,7 +725,11 @@ mod tests {
         use crate::app::App;
         use alloy_core::{config::Config, document::Document};
 
-        let app = App::new(Config::default(), Document::new());
+        let app = App::new(
+            Config::default(),
+            Document::new(),
+            DetectedImageProtocol::Kitty,
+        );
 
         let wide = Rect::new(0, 0, 120, 40);
         let (_, preview) = split_body(&app, wide);
@@ -638,7 +745,11 @@ mod tests {
         use crate::app::App;
         use alloy_core::{config::Config, document::Document};
 
-        let mut app = App::new(Config::default(), Document::new());
+        let mut app = App::new(
+            Config::default(),
+            Document::new(),
+            DetectedImageProtocol::Kitty,
+        );
         app.preview_mode = PreviewMode::Hidden;
 
         let wide = Rect::new(0, 0, 200, 50);
