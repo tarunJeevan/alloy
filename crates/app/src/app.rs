@@ -240,6 +240,7 @@ impl App {
             footnotes: false, // NOTE: Not in config yet.
             frontmatter: config.markdown.extensions.frontmatter,
             math: config.markdown.extensions.math,
+            highlighting: config.highlighting.clone(),
         };
 
         // Check whether the terminal supports hyperlinks.
