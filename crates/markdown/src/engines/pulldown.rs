@@ -27,6 +27,15 @@
 //! - when images are disabled
 //! - the protocol is unsupported
 //! - the image fails to load
+//!
+//! Syntax highlighting:
+//!
+//! - When a `Highlighter` is provided, fenced code blocks whose language tag matches a known syntax are highlighted using syntect.
+//! - Unknown tags fall back to the configured `FallbackStyle`.
+//! - Highlighting is applied inside `end_code_block` using the accumulated `code_block_content` buffer.
+//! - The `RenderContext` receives a reference to the `Highlighter` and the `HighlightingConfig` for the duration of each render call.
+
+use std::sync::Arc;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -35,9 +44,12 @@ use ratatui::{
 };
 use tracing::warn;
 
-use alloy_core::links::{Link, LinkIndex, LinkTarget, normalize_anchor};
+use alloy_core::{
+    config::{FallbackStyle, HighlightingConfig},
+    links::{Link, LinkIndex, LinkTarget, normalize_anchor},
+};
 
-use crate::engine::MarkdownEngine;
+use crate::{engine::MarkdownEngine, highlight::Highlighter};
 
 // -----------------------------------------------------------
 // Configuration
@@ -81,23 +93,95 @@ impl EngineExtensions {
 /// Uses `pulldown-cmark` for parsing and converts events to `ratatui::text::Text<'static>` directly (no ANSI intermediate).
 ///
 /// THREAD SAFETY: `PulldownEngine` is `Send + Sync` because it holds only a plain `EngineExtensions` value (no internal mutability).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct PulldownEngine {
     extensions: EngineExtensions,
+
+    /// Shared syntax highlighter.
+    ///
+    /// NOTE: Always `Some` in normal operation. `None` only in unit tests that use `default()` or `with_gfm()`.
+    highlighter: Option<Arc<Highlighter>>,
+
+    /// Highlighting configuration (theme name, enabled flag, fallback style).
+    highlighting_config: HighlightingConfig,
+}
+
+impl std::fmt::Debug for PulldownEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PulldownEngine")
+            .field("extensions", &self.extensions)
+            .field("highlighting_config", &self.highlighting_config)
+            .field("theme", &self.highlighting_config.theme)
+            .finish()
+    }
+}
+
+impl Default for PulldownEngine {
+    fn default() -> Self {
+        Self {
+            extensions: EngineExtensions::default(),
+            highlighter: None,
+            highlighting_config: HighlightingConfig::default(),
+        }
+    }
 }
 
 impl PulldownEngine {
+    /// Construct with explicit extension flags and no highlighter.
+    ///
+    /// Code blocks will use plain monospace styling regardless of `highlighting_config.enabled`.
     pub fn new(extensions: EngineExtensions) -> Self {
-        Self { extensions }
+        Self {
+            extensions,
+            highlighter: None,
+            highlighting_config: HighlightingConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        }
     }
 
-    /// Convenience constructor for tests: GFM on, footnotes off.
+    /// Construct with extension flags AND a shared `Highlighter`.
+    pub fn new_with_highlighting(
+        extensions: EngineExtensions,
+        highlighter: Arc<Highlighter>,
+        highlighting_config: HighlightingConfig,
+    ) -> Self {
+        Self {
+            extensions,
+            highlighter: Some(highlighter),
+            highlighting_config,
+        }
+    }
+
+    /// Convenience constructor for tests: GFM on, footnotes off, no highlighting.
     pub fn with_gfm() -> Self {
         Self::new(EngineExtensions {
             gfm: true,
             footnotes: false,
             wiki_links: false,
         })
+    }
+
+    /// Convenience constructor for highlighting tests.
+    ///
+    /// Loads bundled syntect defaults and uses the given theme name.
+    pub fn with_highlighting(theme: &str) -> Self {
+        let highlighter = Arc::new(Highlighter::load_defaults());
+        let config = HighlightingConfig {
+            enabled: true,
+            theme: theme.to_owned(),
+            fallback_style: FallbackStyle::Dimmed,
+        };
+
+        Self::new_with_highlighting(
+            EngineExtensions {
+                gfm: true,
+                ..Default::default()
+            },
+            highlighter,
+            config,
+        )
     }
 }
 
@@ -112,7 +196,13 @@ impl MarkdownEngine for PulldownEngine {
         let opts = self.extensions.to_pulldown_options();
         let parser = Parser::new_ext(src, opts);
 
-        render_events(parser, col_width, self.extensions.wiki_links)
+        render_events(
+            parser,
+            col_width,
+            self.extensions.wiki_links,
+            self.highlighter.as_deref(),
+            &self.highlighting_config,
+        )
     }
 
     /// HTML output is deferred to Phase 4 (comrak integration).
@@ -136,8 +226,10 @@ pub(crate) fn render_events<'a>(
     events: impl Iterator<Item = Event<'a>>,
     col_width: u16,
     wiki_links: bool,
+    highlighter: Option<&Highlighter>,
+    hl_config: &HighlightingConfig,
 ) -> (Text<'static>, LinkIndex) {
-    let mut ctx = RenderContext::new(col_width, wiki_links);
+    let mut ctx = RenderContext::new(col_width, wiki_links, highlighter, hl_config);
 
     for event in events {
         ctx.handle_event(event);
@@ -154,7 +246,7 @@ pub(crate) fn render_events<'a>(
 // -----------------------------------------------------------
 
 /// Tracks all mutable state accumulated during a single render pass.
-struct RenderContext {
+struct RenderContext<'h> {
     /// Finished lines ready to be put into `Text`.
     lines: Vec<Line<'static>>,
 
@@ -229,6 +321,16 @@ struct RenderContext {
     /// pulldown-cmark emits the alt text as one or more Text events between `Start(Tag::Image)` and `End(TagEng::Image)`.
     /// Cleared on `End(TagEnd::Image)`.
     pending_image_alt: String,
+
+    /// Accumulated raw text lines inside a fenced code block.
+    /// Collected during `Event::Text` and consumed in `end_code_block`.
+    code_block_content: String,
+
+    /// Reference to the shared syntax highlighter (if any).
+    highlighter: Option<&'h Highlighter>,
+
+    /// Highlighting config for this render pass.
+    hl_config: &'h HighlightingConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,8 +339,13 @@ enum ListKind {
     Ordered,
 }
 
-impl RenderContext {
-    fn new(col_width: u16, wiki_links_enabled: bool) -> Self {
+impl<'h> RenderContext<'h> {
+    fn new(
+        col_width: u16,
+        wiki_links_enabled: bool,
+        highlighter: Option<&'h Highlighter>,
+        hl_config: &'h HighlightingConfig,
+    ) -> Self {
         Self {
             lines: Vec::new(),
             current_spans: Vec::new(),
@@ -262,6 +369,9 @@ impl RenderContext {
             in_image: false,
             pending_image_url: String::new(),
             pending_image_alt: String::new(),
+            code_block_content: String::new(),
+            highlighter,
+            hl_config,
         }
     }
 
@@ -359,6 +469,7 @@ impl RenderContext {
     fn begin_code_block(&mut self, lang: Option<String>) {
         self.in_code_block = true;
         self.code_block_lang = lang.clone();
+        self.code_block_content.clear(); // Reset text accumulator
 
         // Language tag line.
         let label = lang.as_deref().unwrap_or("text");
@@ -381,6 +492,46 @@ impl RenderContext {
             let spans: Vec<Span<'static>> = self.current_spans.drain(..).collect();
             self.lines.push(Line::from(spans));
         }
+
+        // Highlighting path
+        let should_highlight = self.hl_config.enabled
+            && self.highlighter.is_some()
+            && !self.code_block_content.is_empty();
+
+        if should_highlight {
+            let hl = self.highlighter.unwrap();
+            let lang = self.code_block_lang.as_deref();
+            let highlighted_lines = hl.highlight_block(
+                &self.code_block_content,
+                lang,
+                &self.hl_config.theme,
+                &self.hl_config.fallback_style,
+            );
+
+            // Each highlighted line is endented with a tab to match the prior plain rendering style and distinguish code from prose.
+            for hl_line in highlighted_lines {
+                let mut indented_spans: Vec<Span<'static>> =
+                    Vec::with_capacity(hl_line.spans.len() + 1);
+                indented_spans.push(Span::raw("\t"));
+                indented_spans.extend(hl_line.spans.into_iter());
+                self.lines.push(Line::from(indented_spans));
+            }
+        } else {
+            // Plain style fallback - render the accumulated content as monospace.
+            let code_style = Style::default().fg(Color::White).bg(Color::Reset);
+            for line_str in self.code_block_content.lines() {
+                self.lines.push(Line::from(Span::styled(
+                    format!("\t{line_str}"),
+                    code_style,
+                )));
+            }
+            // Emit one trailing blank line inside the block to match prior behavior.
+            if !self.code_block_content.is_empty() {
+                self.lines.push(Line::from(Span::styled("\t", code_style)));
+            }
+        }
+
+        self.code_block_content.clear();
 
         // Footer rule.
         let width = self.col_width.max(1) as usize;
@@ -521,22 +672,9 @@ impl RenderContext {
 
                 if self.in_code_block {
                     // Each line of a code block arrives as a separate Text event terminated by '\n'.
-                    // Split and emit individual lines.
-                    let code_style = Style::default().fg(Color::White).bg(Color::Reset);
-                    let content = s;
-                    let lines: Vec<&str> = content.split('\n').collect();
-                    for (i, line) in lines.iter().enumerate() {
-                        self.current_spans
-                            .push(Span::styled(format!("\t{line}"), code_style));
-
-                        // Flush between lines but not after the last fragment (the trailing '\n' produces an empty final element).
-                        if i < lines.len().saturating_sub(1) {
-                            let spans: Vec<Span<'static>> = self.current_spans.drain(..).collect();
-                            if !spans.iter().all(|s| s.content == "  ") {
-                                self.lines.push(Line::from(spans));
-                            }
-                        }
-                    }
+                    // Accumulate into buffer and emit highlighted lines in `end_code_block`.
+                    self.code_block_content.push_str(s);
+                    // NOTE: Old code
                 } else if self.in_image {
                     // Alt text inside an image tag - accumulate, don't emit.
                     self.pending_image_alt.push_str(s);
@@ -1460,6 +1598,139 @@ mod tests {
         assert_eq!(links.get(0).unwrap().display_text, "Click Here");
     }
 
+    // Highlighting integration tests
+
+    #[test]
+    fn highlighted_rust_block_contains_code_content() {
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let text = engine.render_terminal("```rust\nfn main() {}\n```\n", 80);
+        let plain = text_to_plain(&text);
+
+        assert!(
+            plain.contains("fn main()"),
+            "highlighted block should contain code: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn highlighted_rust_block_has_colored_spans() {
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let text = engine.render_terminal(
+            "```rust\nfn add(a: i32, b: i32) -> i32 { a + b }\n```\n",
+            80,
+        );
+
+        // Find spans inside the code block (skip header/footer lines).
+        // Header line contains "┌─ rust", footer contains "└".
+        let code_lines: Vec<_> = text
+            .lines
+            .iter()
+            .filter(|l| {
+                let content: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                !content.contains("┌─") && !content.contains("└") && !content.trim().is_empty()
+            })
+            .collect();
+
+        assert!(
+            !code_lines.is_empty(),
+            "expected at least one code content line"
+        );
+
+        // At least some spans should have non-default (non-white) fg colors from syntect.
+        let has_colored_span = code_lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))))
+        });
+
+        assert!(
+            has_colored_span,
+            "highlighted Rust block should have at least one Rgb-colored span"
+        );
+    }
+
+    #[test]
+    fn highlighted_python_block_contains_code_content() {
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let src = "```python\ndef greet(name):\n    return f\"Hello, {name}!\"\n```\n";
+        let text = engine.render_terminal(src, 80);
+        let plain = text_to_plain(&text);
+
+        assert!(
+            plain.contains("def greet"),
+            "python code should appear in output: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_lang_uses_fallback_not_panic() {
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let src = "```brainfuck_unknown\n+-><\n```\n";
+        // Must not panic; content must appear in output.
+        let text = engine.render_terminal(src, 80);
+        let plain = text_to_plain(&text);
+
+        assert!(
+            plain.contains("+->"),
+            "unknown lang content should still appear: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn empty_lang_tag_uses_fallback_not_panic() {
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let src = "```\nplain code block\n```\n";
+        let text = engine.render_terminal(src, 80);
+        let plain = text_to_plain(&text);
+
+        assert!(
+            plain.contains("plain code block"),
+            "empty lang content should appear: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn highlighting_disabled_falls_through_to_plain() {
+        // PulldownEngine::with_gfm() has no highlighter — code blocks use plain styling.
+        let engine = PulldownEngine::with_gfm();
+        let src = "```rust\nlet x = 1;\n```\n";
+        let text = engine.render_terminal(src, 80);
+        let plain = text_to_plain(&text);
+        assert!(
+            plain.contains("let x = 1;"),
+            "plain engine should still show code: {plain:?}"
+        );
+
+        // No Rgb spans in plain mode.
+        let has_rgb = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+
+        assert!(
+            !has_rgb,
+            "plain engine should not produce Rgb-colored spans"
+        );
+    }
+
+    #[test]
+    fn no_newlines_in_highlighted_span_content() {
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let src = "```rust\nlet a = 1;\nlet b = 2;\n```\n";
+        let text = engine.render_terminal(src, 80);
+
+        for line in &text.lines {
+            for span in &line.spans {
+                assert!(
+                    !span.content.contains('\n'),
+                    "span must not contain newlines: {:?}",
+                    span.content
+                );
+            }
+        }
+    }
+
     // Insta snapshot tests
 
     #[test]
@@ -1490,6 +1761,47 @@ mod tests {
     fn snapshot_blockquote_md() {
         let src = include_str!("../../tests/fixtures/blockquote.md");
         let out = render(src);
+
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snapshot_highlight_rust() {
+        let src = include_str!("../../tests/fixtures/highlight_rust.md");
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let text = engine.render_terminal(src, 80);
+        let out = text_to_plain(&text);
+
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snapshot_highlight_python() {
+        let src = include_str!("../../tests/fixtures/highlight_python.md");
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let text = engine.render_terminal(src, 80);
+        let out = text_to_plain(&text);
+
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snapshot_highlight_unknown_lang() {
+        let src = include_str!("../../tests/fixtures/highlight_unknown_lang.md");
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let text = engine.render_terminal(src, 80);
+        let out = text_to_plain(&text);
+
+        insta::assert_snapshot!(out);
+    }
+
+    #[test]
+    fn snapshot_highlight_empty_lang() {
+        let src = include_str!("../../tests/fixtures/highlight_empty_lang.md");
+        let engine = PulldownEngine::with_highlighting("base16-ocean.dark");
+        let text = engine.render_terminal(src, 80);
+        let out = text_to_plain(&text);
+
         insta::assert_snapshot!(out);
     }
 }

@@ -1,0 +1,16 @@
+---
+source: crates/markdown/src/engines/pulldown.rs
+expression: out
+---
+
+# Rust Code Block
+
+
+┌─ rust ────────────────────────────────────────────────────────────────────────
+	fn main() {
+	    let greeting = "Hello, alloy!";
+	    println!("{greeting}");
+	}
+└───────────────────────────────────────────────────────────────────────────────
+
+A paragraph after the code block.

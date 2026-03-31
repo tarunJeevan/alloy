@@ -5,6 +5,7 @@ pub mod links;
 pub mod modes;
 pub mod search;
 
+pub use config::{FallbackStyle, HighlightingConfig};
 pub use document::Document;
 pub use errors::CoreError;
 pub use links::{Link, LinkIndex, LinkTarget, normalize_anchor};
