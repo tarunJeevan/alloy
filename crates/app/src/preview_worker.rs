@@ -36,10 +36,10 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
-use alloy_core::links::LinkIndex;
+use alloy_core::{config::HighlightingConfig, links::LinkIndex};
 use markdown::{
     ComrakEngine, ComrakExtensions, MarkdownEngine, PulldownEngine,
-    engines::pulldown::EngineExtensions,
+    engines::pulldown::EngineExtensions, highlight::Highlighter,
 };
 
 // ---------------------------------------------------------
@@ -56,6 +56,7 @@ pub struct WorkerExtensions {
     pub footnotes: bool,
     pub frontmatter: bool,
     pub math: bool,
+    pub highlighting: HighlightingConfig,
 }
 
 impl WorkerExtensions {
@@ -139,17 +140,35 @@ pub fn spawn_worker(
     // Unbounded result channel - the worker sends at most one result per render cycle so there's no risk of backlog.
     let (res_tx, res_rx) = std::sync::mpsc::channel::<RenderResult>();
 
-    // Construct the terminal engine (PulldownEngine) for fast text rendering.
-    let terminal_engine: Arc<dyn MarkdownEngine> =
-        Arc::new(PulldownEngine::new(extensions.to_engine_extensions()));
-
-    // Construct the HTML engine (ComrakEngine) for HTML output.
-    let html_engine: Arc<dyn MarkdownEngine> =
-        Arc::new(ComrakEngine::new(extensions.to_comrak_extensions()));
+    // Clone what's needed to move into the thread.
+    let engine_extensions = extensions.to_engine_extensions();
+    let comrak_extensions = extensions.to_comrak_extensions();
+    let highlighting_config = extensions.highlighting.clone();
 
     let handle = std::thread::Builder::new()
         .name("preview-worker".into())
         .spawn(move || {
+            // Construct highlighter on the worker thread. Done here so the 5-20ms process doesn't block app startup.
+            let highlighter = Arc::new(Highlighter::load_defaults());
+
+            tracing::debug!(
+            highlighting_enabled = highlighting_config.enabled,
+            theme = %highlighting_config.theme,
+            "preview worker: highlighter loaded"
+            );
+
+            // Construct the terminal engine (PulldownEngine) for fast text rendering.
+            let terminal_engine: Arc<dyn MarkdownEngine> =
+                Arc::new(PulldownEngine::new_with_highlighting(
+                    engine_extensions,
+                    highlighter,
+                    highlighting_config,
+                ));
+
+            // Construct the HTML engine (ComrakEngine) for HTML output.
+            let html_engine: Arc<dyn MarkdownEngine> =
+                Arc::new(ComrakEngine::new(comrak_extensions));
+
             worker_loop(
                 req_rx,
                 res_tx,
@@ -289,6 +308,7 @@ mod tests {
     fn default_extensions() -> WorkerExtensions {
         WorkerExtensions {
             gfm: true,
+            highlighting: HighlightingConfig::default(),
             ..Default::default()
         }
     }
@@ -339,7 +359,7 @@ mod tests {
         let (tx, rx, _handle) = spawn_worker(30, default_extensions());
 
         tx.try_send(req(42)).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(800));
 
         let result = rx.try_recv().expect("expected a result");
         assert_eq!(result.revision, 42);
@@ -356,7 +376,7 @@ mod tests {
         })
         .unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(800));
 
         let result = rx.try_recv().expect("expected a result");
 
@@ -385,7 +405,7 @@ mod tests {
         })
         .unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(800));
 
         let result = rx.try_recv().expect("expected a result");
         assert!(
@@ -406,7 +426,7 @@ mod tests {
         })
         .unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(800));
 
         let result = rx.try_recv().expect("expected a result");
 
@@ -432,7 +452,7 @@ mod tests {
         })
         .unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(800));
 
         let result = rx.try_recv().expect("expected a result");
 
@@ -471,6 +491,48 @@ mod tests {
         assert!(
             count < (n as usize),
             "expected debounce to coalesce requests; got {count} renders for {n} requests"
+        );
+    }
+
+    #[test]
+    fn worker_highlighting_produces_rgb_spans_for_rust_block() {
+        use alloy_core::config::{FallbackStyle, HighlightingConfig};
+        use ratatui::style::Color;
+
+        let extensions = WorkerExtensions {
+            gfm: true,
+            highlighting: HighlightingConfig {
+                enabled: true,
+                theme: "base16-ocean.dark".into(),
+                fallback_style: FallbackStyle::Dimmed,
+            },
+            ..Default::default()
+        };
+
+        let (tx, rx, _handle) = spawn_worker(30, extensions);
+
+        tx.try_send(RenderRequest {
+            revision: 1,
+            markdown: "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n".to_owned(),
+            col_width: 80,
+        })
+        .unwrap();
+
+        // Wait longer since Highlighter::load_defaults() runs on the thread.
+        std::thread::sleep(Duration::from_millis(600));
+
+        let result = rx.try_recv().expect("expected a render result from worker");
+
+        let has_rgb = result
+            .rendered
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+
+        assert!(
+            has_rgb,
+            "worker with highlighting enabled should produce Rgb-colored spans for Rust code"
         );
     }
 }
