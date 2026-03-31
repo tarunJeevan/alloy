@@ -10,9 +10,9 @@ expression: out
 
 
 ┌─ rust ────────────────────────────────────────────────────────────────────────
-	fn main() {	
-	  println!("Hello, alloy!");	
-	}	
+	fn main() {
+	  println!("Hello, alloy!");
+	}
 	
 └───────────────────────────────────────────────────────────────────────────────
 
@@ -21,8 +21,8 @@ expression: out
 
 
 ┌─ python ──────────────────────────────────────────────────────────────────────
-	def greet(name: str) -> str:	
-	  return f"Hello, {name}!"	
+	def greet(name: str) -> str:
+	  return f"Hello, {name}!"
 	
 └───────────────────────────────────────────────────────────────────────────────
 
@@ -31,8 +31,8 @@ expression: out
 
 
 ┌─ text ────────────────────────────────────────────────────────────────────────
-	plain text code block	
-	with multiple lines	
+	plain text code block
+	with multiple lines
 	
 └───────────────────────────────────────────────────────────────────────────────
 
@@ -47,8 +47,8 @@ Use `cargo build --release` to compile. The function `render_terminal` is in the
 
 
 ┌─ text ────────────────────────────────────────────────────────────────────────
-	indented line one	
-		indented line two	
+	indented line one
+	indented line two
 	
 └───────────────────────────────────────────────────────────────────────────────
 

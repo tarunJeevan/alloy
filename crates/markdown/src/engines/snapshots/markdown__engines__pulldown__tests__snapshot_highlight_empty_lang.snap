@@ -1,0 +1,15 @@
+---
+source: crates/markdown/src/engines/pulldown.rs
+expression: out
+---
+
+# Empty Language Tag Code Block
+
+
+┌─ text ────────────────────────────────────────────────────────────────────────
+	plain text code block
+	with multiple lines
+	no language specified
+└───────────────────────────────────────────────────────────────────────────────
+
+A paragraph after the code block.
