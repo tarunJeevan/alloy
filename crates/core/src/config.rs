@@ -42,6 +42,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub terminal: TerminalConfig,
     pub images: ImagesConfig,
+    #[serde(default)]
+    pub highlighting: HighlightingConfig,
 }
 
 /// The config schema version written by this build.
@@ -58,6 +60,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             terminal: TerminalConfig::default(),
             images: ImagesConfig::default(),
+            highlighting: HighlightingConfig::default(),
         }
     }
 }
@@ -363,6 +366,48 @@ pub fn config_file_path() -> Result<PathBuf, CoreError> {
 }
 
 // -----------------------------------------------------------------------
+// Highlighting Config
+// -----------------------------------------------------------------------
+
+/// Syntax highlighting settings for fenced code blocks in the preview pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HighlightingConfig {
+    /// Enable syntax highlighting for fenced code blocks.
+    /// When `false`, code blocks use plain monospace styling.
+    pub enabled: bool,
+
+    /// Syntect theme name to use for code highlighting.
+    /// An unknown theme name silently falls back to "base16-ocean.dark"
+    pub theme: String,
+
+    /// Style applied to code blocks with an unknown or empty language tag.
+    pub fallback_style: FallbackStyle,
+}
+
+impl Default for HighlightingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            theme: "base16-ocean.dark".into(),
+            fallback_style: FallbackStyle::Dimmed,
+        }
+    }
+}
+
+/// Controls the appearance of code blcoks when the language tag is unknown or unspecified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackStyle {
+    /// Apply DIM modifier - visually de-emphasizes plain/unknown code blocks.
+    #[default]
+    Dimmed,
+
+    /// No additional styling - plain monospace text at the default foreground color.
+    Plain,
+}
+
+// -----------------------------------------------------------------------
 // Load / Save
 // -----------------------------------------------------------------------
 
@@ -587,6 +632,92 @@ mod tests {
         assert!(
             toml_str.contains("protocol = \"off\""),
             "expected 'off' in toml: {toml_str}"
+        );
+    }
+
+    // HighlightingConfig tests
+
+    #[test]
+    fn default_highlighting_config_is_enabled_with_ocean_theme() {
+        let cfg = HighlightingConfig::default();
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.theme, "base16-ocean.dark");
+        assert_eq!(cfg.fallback_style, FallbackStyle::Dimmed);
+    }
+
+    #[test]
+    fn highlighting_config_round_trips() {
+        let mut cfg = Config::default();
+        cfg.highlighting.enabled = false;
+        cfg.highlighting.theme = "Solarized (dark)".into();
+        cfg.highlighting.fallback_style = FallbackStyle::Plain;
+
+        let toml_str = toml::to_string_pretty(&cfg).expect("serialize failed");
+        let back: Config = toml::from_str(&toml_str).expect("deserialize failed");
+
+        assert!(!back.highlighting.enabled);
+        assert_eq!(back.highlighting.theme, "Solarized (dark)");
+        assert_eq!(back.highlighting.fallback_style, FallbackStyle::Plain);
+    }
+
+    #[test]
+    fn config_with_no_highlighting_section_uses_defaults() {
+        // Simulate a config file written before Chunk 8.1 (no [highlighting] section).
+        // Thanks to #[serde(default)], this should deserialize cleanly.
+        let toml_without_highlighting = r#"
+config_version = 1
+[theme]
+name = "default"
+code_theme = "base16-ocean.dark"
+[keymap]
+[editor]
+preview_debounce_ms = 150
+sequence_timeout_ms = 500
+line_numbers = true
+tab_width = 4
+search_case_insensitive = true
+[markdown]
+engine = "pulldown_cmark"
+[markdown.extensions]
+gfm = true
+wiki_links = false
+frontmatter = false
+math = false
+[ui]
+split_ratio = 50
+initial_preview_mode = "rendered"
+[terminal]
+hyperlinks = "off"
+[images]
+enabled = true
+protocol = "auto"
+fetch_remote = false
+"#;
+        let cfg: Config = toml::from_str(toml_without_highlighting)
+            .expect("should parse without [highlighting] section");
+
+        // Should get defaults for the missing section.
+        assert!(
+            cfg.highlighting.enabled,
+            "default highlighting should be enabled"
+        );
+        assert_eq!(cfg.highlighting.theme, "base16-ocean.dark");
+        assert_eq!(cfg.highlighting.fallback_style, FallbackStyle::Dimmed);
+    }
+
+    #[test]
+    fn fallback_style_serializes_correctly() {
+        let cfg = HighlightingConfig {
+            enabled: true,
+            theme: "InspiredGitHub".into(),
+            fallback_style: FallbackStyle::Plain,
+        };
+        let toml_str = toml::to_string_pretty(&cfg).expect("serialize failed");
+
+        assert!(
+            toml_str.contains("fallback_style = \"plain\""),
+            "expected 'plain' in toml: {toml_str}"
         );
     }
 }
