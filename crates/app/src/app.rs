@@ -548,11 +548,11 @@ impl App {
                         s.recompute(&content);
                     }
                     // Move cursor to current match so the user sees incremental results.
-                    if let Some(ref s) = self.search {
-                        if let Some(m) = s.current() {
-                            let (line, col) = (m.line as u16, m.col as u16);
-                            self.textarea.move_cursor(CursorMove::Jump(line, col));
-                        }
+                    if let Some(ref s) = self.search
+                        && let Some(m) = s.current()
+                    {
+                        let (line, col) = (m.line as u16, m.col as u16);
+                        self.textarea.move_cursor(CursorMove::Jump(line, col));
                     }
                 }
                 // Sync highlights after pattern change.
@@ -572,11 +572,11 @@ impl App {
                         let (row, col) = self.search_saved_cursor;
                         self.textarea
                             .move_cursor(CursorMove::Jump(row as u16, col as u16));
-                    } else if let Some(ref s) = self.search {
-                        if let Some(m) = s.current() {
-                            self.textarea
-                                .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16));
-                        }
+                    } else if let Some(ref s) = self.search
+                        && let Some(m) = s.current()
+                    {
+                        self.textarea
+                            .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16));
                     }
                 }
                 // Sync highlights after pattern change.
@@ -589,12 +589,13 @@ impl App {
                 apply_normal_mode_style(&mut self.textarea, &self.config);
 
                 // Move cursor to the current match (already done incrementally but ensures correctness on Enter without any prior navigation).
-                if let Some(ref s) = self.search {
-                    if let Some(m) = s.current() {
-                        self.textarea
-                            .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16))
-                    }
+                if let Some(ref s) = self.search
+                    && let Some(m) = s.current()
+                {
+                    self.textarea
+                        .move_cursor(CursorMove::Jump(m.line as u16, m.col as u16))
                 }
+
                 // Highlights remain active after commit so the user can see all matches.
                 self.sync_textarea_search();
 
@@ -1736,7 +1737,7 @@ mod tests {
         let doc = Document::open(&path).expect("open temp file");
         let mut app = App::new(Config::default(), doc, DetectedImageProtocol::None);
 
-        app.execute_command(&format!("wq"));
+        app.execute_command("wq");
 
         // There's a valid path, so save should succeed and should_quit = true.
         // (The actual wq path-less case is tested by execute_w_with_no_path_pushes_error_notification)

@@ -93,7 +93,7 @@ impl ComrakExtensions {
 ///
 /// `ComrakEngine` is `Send + Sync` because:
 /// - `comrak::Options` contains only plain data (no interior mutability)
-/// `PulldownEngine` is already `Send + Sync`
+/// - `PulldownEngine` is already `Send + Sync`
 pub struct ComrakEngine {
     opts: Options<'static>,
     terminal_engine: PulldownEngine,

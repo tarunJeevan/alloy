@@ -93,7 +93,7 @@ impl EngineExtensions {
 /// Uses `pulldown-cmark` for parsing and converts events to `ratatui::text::Text<'static>` directly (no ANSI intermediate).
 ///
 /// THREAD SAFETY: `PulldownEngine` is `Send + Sync` because it holds only a plain `EngineExtensions` value (no internal mutability).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PulldownEngine {
     extensions: EngineExtensions,
 
@@ -113,16 +113,6 @@ impl std::fmt::Debug for PulldownEngine {
             .field("highlighting_config", &self.highlighting_config)
             .field("theme", &self.highlighting_config.theme)
             .finish()
-    }
-}
-
-impl Default for PulldownEngine {
-    fn default() -> Self {
-        Self {
-            extensions: EngineExtensions::default(),
-            highlighter: None,
-            highlighting_config: HighlightingConfig::default(),
-        }
     }
 }
 
@@ -435,7 +425,7 @@ impl<'h> RenderContext<'h> {
             spans.push(Span::styled(p, prefix_style));
         }
 
-        spans.extend(self.current_spans.drain(..));
+        spans.append(&mut self.current_spans);
 
         // Skip pushing truly empty lines in blockquotes (they already render as gutters).
         if spans.iter().all(|s| s.content.trim().is_empty()) && self.blockquote_depth == 0 {
@@ -1047,7 +1037,8 @@ fn wrap_line(spans: Vec<Span<'static>>, col_width: u16) -> Vec<Line<'static>> {
 
                 if current_width + word_w > max && !current_line.is_empty() {
                     // Flush the current line and start a new one.
-                    output_lines.push(Line::from(current_line.drain(..).collect::<Vec<_>>()));
+                    // output_lines.push(Line::from(current_line.drain(..).collect::<Vec<_>>()));
+                    output_lines.push(Line::from(std::mem::take(&mut current_line)));
                     current_width = 0;
                 }
 
