@@ -8,17 +8,6 @@
 //! - Run the event loop
 //! - Restore the terminal on exit (clean path AND panic path)
 
-// #[macro_use(defer_on_unwind)]
-// extern crate scopeguard;
-
-mod app;
-mod cli;
-mod image_cache;
-mod image_proto;
-mod keymap;
-mod preview_worker;
-mod ui;
-
 use std::{io, time::Duration};
 
 use anyhow::{Context, Result};
@@ -32,10 +21,8 @@ use ratatui::{
     },
 };
 
+use alloy_app::{App, CliArgs, DetectedImageProtocol, image_proto::detect_from_env, ui};
 use alloy_core::{config::Config, document::Document};
-use app::App;
-use cli::CliArgs;
-use image_proto::DetectedImageProtocol;
 
 // Terminal lifecycle
 
@@ -125,8 +112,7 @@ fn main() -> Result<()> {
 ///
 /// On success, maps the detected `Picker` into our `DetectedImageProtocol` enum.
 /// On timeout or error (common in tmux, screen), falls back to env-var heuristics.
-fn detect_protocol_with_timeout(timeout: Duration) -> image_proto::DetectedImageProtocol {
-    use image_proto::detect_from_env;
+fn detect_protocol_with_timeout(timeout: Duration) -> DetectedImageProtocol {
     use ratatui_image::picker::Picker;
     use std::sync::mpsc;
 
@@ -136,12 +122,7 @@ fn detect_protocol_with_timeout(timeout: Duration) -> image_proto::DetectedImage
     // The thread sends its result back via the channel.
     std::thread::spawn(move || {
         let result = match Picker::from_query_stdio() {
-            Ok(picker) => {
-                // Map ratatui-image's protocol type to our enum.
-                let proto = map_picker_protocol(&picker);
-                tracing::debug!(?proto, "ratatui-image picker detection succeeded");
-                Ok(proto)
-            }
+            Ok(picker) => Ok(map_picker_protocol(&picker)),
             Err(e) => {
                 tracing::debug!("ratatui-image picker detection failed: {e}");
                 Err(e.to_string())
@@ -169,9 +150,7 @@ fn detect_protocol_with_timeout(timeout: Duration) -> image_proto::DetectedImage
 }
 
 /// Map a ratatui-image Picker's detected protocol to our DetectedImageProtocol.
-fn map_picker_protocol(
-    picker: &ratatui_image::picker::Picker,
-) -> image_proto::DetectedImageProtocol {
+fn map_picker_protocol(picker: &ratatui_image::picker::Picker) -> DetectedImageProtocol {
     use ratatui_image::picker::ProtocolType;
 
     // Picker::protocol() returns the detected Protocol variant.
@@ -199,12 +178,12 @@ fn run_event_loop(
             match event::read()? {
                 Event::Key(key) => {
                     // Ignore key-release and key-repeat events - only act on key-press.
-                    if key.kind == KeyEventKind::Press {
-                        if let Err(e) = app.handle_key(key) {
-                            // Surface errors in the notification queue.
-                            app.notify_error(format!("{e:#}"));
-                            tracing::error!("handle_key error: {e:#}");
-                        }
+                    if key.kind == KeyEventKind::Press
+                        && let Err(e) = app.handle_key(key)
+                    {
+                        // Surface errors in the notification queue.
+                        app.notify_error(format!("{e:#}"));
+                        tracing::error!("handle_key error: {e:#}");
                     }
                 }
                 Event::Resize(_, _) => {
