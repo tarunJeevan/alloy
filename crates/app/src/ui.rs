@@ -345,7 +345,7 @@ fn render_command_prompt(frame: &mut Frame, app: &App, area: Rect) {
 /// Format:
 /// `/` OR `?` prefix, then the pattern, then `_` cursor, then the match counter right-aligned.
 ///
-/// Example: `/ hello_					[2/4]`
+/// Example: `/ hello_                   [2/4]`
 fn render_search_prompt(frame: &mut Frame, app: &App, area: Rect) {
     use alloy_core::search::SearchKind;
 
@@ -401,7 +401,7 @@ fn render_search_prompt(frame: &mut Frame, app: &App, area: Rect) {
 /// Render the single-line link-selection prompt.
 ///
 /// Format:
-/// `[LINKS 2/4] -> https://example.com		j/k:nav  Enter:follow  Esc:cancel`
+/// `[LINKS 2/4] -> https://example.com    j/k:nav  Enter:follow  Esc:cancel`
 fn render_link_select_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let counter = app.link_select_counter();
     let target_str = app.current_link_display().unwrap_or("-");
