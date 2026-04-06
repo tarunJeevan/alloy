@@ -224,44 +224,17 @@ fn preview_block(title: &'static str, border_color: Color) -> Block<'static> {
 }
 
 /// Render inline images into the preview area by overlaying `StatefulImage` widgets on top of the placeholder spans already drawn by `render_preview_rendered`.
-///
-/// NOTE: This is an intentionally simple image rendering method - "good enough" for MVP. A pixel-accurate layout would require the renderer to emit explicit image placement metadata.
 fn render_preview_images(frame: &mut Frame, app: &mut App, inner: Rect) {
-    use alloy_core::links::LinkTarget;
     use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 
-    // Collect image URLs from the link index (filtering out heading anchors and regular links).
-    let image_urls: Vec<(usize, String)> = app
+    // Collect image URLs from the link index with `LinkIndex::images()`.
+    let image_entries: Vec<(usize, String)> = app
         .link_index
-        .0
-        .iter()
-        .filter_map(|link| {
-            match &link.target {
-                // Local file paths - check file extension for image types.
-                LinkTarget::FilePath(path) => {
-                    let ext = path.extension()?.to_str()?.to_lowercase();
-                    matches!(
-                        ext.as_str(),
-                        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-                    )
-                    .then(|| (link.source_line, path.to_string_lossy().into_owned()))
-                }
-                // External URLs - check extensinon heuristic.
-                LinkTarget::External(url) => {
-                    let lower = url.to_lowercase();
-                    (lower.ends_with(".png")
-                        || lower.ends_with(".jpg")
-                        || lower.ends_with(".jpeg")
-                        || lower.ends_with(".gif")
-                        || lower.ends_with("webp"))
-                    .then(|| (link.source_line, url.clone()))
-                }
-                _ => None,
-            }
-        })
+        .images()
+        .map(|(source_line, url, _alt)| (source_line, url.to_owned()))
         .collect();
 
-    if image_urls.is_empty() {
+    if image_entries.is_empty() {
         return;
     }
 
@@ -279,28 +252,29 @@ fn render_preview_images(frame: &mut Frame, app: &mut App, inner: Rect) {
     let base_dir = app.document.path.as_deref().and_then(|p| p.parent());
     let scroll = app.preview_scroll as usize;
 
-    for (source_line, url) in &image_urls {
-        // Estimate the rendered row for this image.
+    for (source_line, url) in &image_entries {
+        // Map source line -> rendered row, accounting for scroll offset.
         let row = source_line.saturating_sub(scroll);
         if row >= inner.height as usize {
             continue; // Image scrolled off screen
         }
 
-        // Reserve a rendering area for image.
-        let img_row = (inner.y + row as u16 + 1).min(inner.y + inner.height.saturating_sub(1));
-        let img_height = 8u16.min(inner.y + inner.height - img_row);
+        // Reserve a rendering area for image. Position one row below the placeholder span.
+        // The +1 skips the placeholder text line itself.
+        let img_y = (inner.y + row as u16 + 1).min(inner.y + inner.height.saturating_sub(1));
+        let img_height = 8u16.min(inner.y + inner.height - img_y);
         if img_height == 0 {
             continue;
         }
 
         let img_rect = Rect {
             x: inner.x,
-            y: img_row,
+            y: img_y,
             width: inner.width,
             height: img_height,
         };
 
-        // Attempt cache lookup + load.
+        // Load / decode / protocol-encode via the cache.
         if let Err(e) = cache.get_or_load(url, &mut picker, fetch_remote, base_dir) {
             tracing::debug!(url, error = %e, "image: load failed; using placeholder");
             continue;
@@ -415,6 +389,7 @@ fn render_link_select_prompt(frame: &mut Frame, app: &App, area: Rect) {
             LinkTarget::InternalAnchor(_) => "ANCHOR",
             LinkTarget::WikiLink(_) => "WIKILINK",
             LinkTarget::FilePath(_) => "FILEPATH",
+            LinkTarget::Image { .. } => "IMAGE",
         })
         .unwrap_or("-");
 
@@ -632,7 +607,6 @@ fn inject_osc8(text: Text<'static>, link_index: &LinkIndex) -> Text<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_proto::DetectedImageProtocol;
 
     #[test]
     fn word_count_empty() {
@@ -704,11 +678,7 @@ mod tests {
         use crate::app::App;
         use alloy_core::{config::Config, document::Document};
 
-        let app = App::new(
-            Config::default(),
-            Document::new(),
-            DetectedImageProtocol::Kitty,
-        );
+        let app = App::new(Config::default(), Document::new(), None);
 
         // Simulate a very narrow body rect
         let narrow = Rect::new(0, 0, MIN_SPLIT_WIDTH - 1, 20);
@@ -725,11 +695,7 @@ mod tests {
         use crate::app::App;
         use alloy_core::{config::Config, document::Document};
 
-        let app = App::new(
-            Config::default(),
-            Document::new(),
-            DetectedImageProtocol::Kitty,
-        );
+        let app = App::new(Config::default(), Document::new(), None);
 
         let wide = Rect::new(0, 0, 120, 40);
         let (_, preview) = split_body(&app, wide);
@@ -745,11 +711,7 @@ mod tests {
         use crate::app::App;
         use alloy_core::{config::Config, document::Document};
 
-        let mut app = App::new(
-            Config::default(),
-            Document::new(),
-            DetectedImageProtocol::Kitty,
-        );
+        let mut app = App::new(Config::default(), Document::new(), None);
         app.preview_mode = PreviewMode::Hidden;
 
         let wide = Rect::new(0, 0, 200, 50);

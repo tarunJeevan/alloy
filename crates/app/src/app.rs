@@ -201,11 +201,7 @@ impl App {
     /// Construct a new `App` from a loaded config and document.
     ///
     /// Seeds the `TextArea` from `document.content()` and applies initial styling from config.
-    pub fn new(
-        config: Config,
-        document: Document,
-        detected_image_protocol: DetectedImageProtocol,
-    ) -> Self {
+    pub fn new(config: Config, document: Document, picker: Option<Picker>) -> Self {
         let content = document.content();
 
         // `TextArea::new()` accepts `Vec<String>` lines. Split on '\n'.
@@ -246,11 +242,14 @@ impl App {
         // Check whether the terminal supports hyperlinks.
         let hyperlinks_supported = supports_hyperlinks::on(supports_hyperlinks::Stream::Stderr);
 
-        // Build Picker if a usable protocol is detected.
-        let picker: Option<Arc<Mutex<Picker>>> = match &detected_image_protocol {
-            DetectedImageProtocol::None => None,
-            _ => Some(Arc::new(Mutex::new(Picker::halfblocks()))),
-        };
+        // Derive the image protocol from the provided picker.
+        let detected_image_protocol = picker
+            .as_ref()
+            .map(map_picker_to_be_detected)
+            .unwrap_or(DetectedImageProtocol::None);
+
+        // Wrap the picker in Arc<Mutex> so it can be shared with the render closure.
+        let picker: Option<Arc<Mutex<Picker>>> = picker.map(|p| Arc::new(Mutex::new(p)));
         let image_cache = Arc::new(Mutex::new(ImageCache::new(20)));
 
         // Spawn the background render thread.
@@ -812,6 +811,10 @@ impl App {
                     path.display()
                 ));
             }
+            LinkTarget::Image { url, .. } => {
+                // Images are not navigable; show a brief informational message.
+                self.notify_info(format!("Image: {url}"));
+            }
         }
     }
 
@@ -1043,6 +1046,31 @@ impl App {
 }
 
 // ---------------------------------------------------------------
+// Image helper function
+// ---------------------------------------------------------------
+
+/// Map a ratatui-image `Picker`'s detected protocol to our `DetectedImageProtocol`.
+fn map_picker_to_be_detected(picker: &Picker) -> DetectedImageProtocol {
+    use ratatui_image::picker::ProtocolType;
+
+    match picker.protocol_type() {
+        ProtocolType::Kitty => DetectedImageProtocol::Kitty,
+        ProtocolType::Halfblocks => DetectedImageProtocol::HalfBlock,
+        _ => {
+            // Check the debug representation as a heuristic for variants we have not listed - Sixel and Iterm2 should show their names.
+            let label = format!("{:?}", picker.protocol_type());
+            if label.contains("Sixel") {
+                DetectedImageProtocol::Sixel
+            } else if label.contains("Iterm") {
+                DetectedImageProtocol::Iterm2
+            } else {
+                DetectedImageProtocol::HalfBlock
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Command string parsing helper
 // ---------------------------------------------------------------
 
@@ -1131,11 +1159,7 @@ mod tests {
     // App command execution (uses Document::new() so no disk I/O)
 
     fn make_app() -> App {
-        App::new(
-            Config::default(),
-            Document::new(),
-            DetectedImageProtocol::None,
-        )
+        App::new(Config::default(), Document::new(), None)
     }
 
     // Preview mode actions
@@ -1735,7 +1759,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let doc = Document::open(&path).expect("open temp file");
-        let mut app = App::new(Config::default(), doc, DetectedImageProtocol::None);
+        let mut app = App::new(Config::default(), doc, None);
 
         app.execute_command("wq");
 

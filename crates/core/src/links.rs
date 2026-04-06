@@ -12,6 +12,7 @@
 //! | `http://...` or `https://...`  | `External`           |
 //! | starts with `#`                | `InternalAnchor`     |
 //! | `[[page]]` or `[[page|title]]` | `WikiLink`           |
+//! | `![alt](url)`                  | `Image`              |
 //! | anything else                  | `FilePath`           |
 //!
 //! Anchor normalization:
@@ -34,12 +35,18 @@ pub enum LinkTarget {
     InternalAnchor(String),
 
     /// A `[[wiki-link]]` or `[[wiki-link|title]]`.
-    /// Cross-file navigation is not supported in MVP. Following one simply shows a notification for now.
+    /// NOTE: Cross-file navigation is not supported in MVP. Following one simply shows a notification for now.
     WikiLink(String),
 
     /// A relative or absolute file path (e.g. `./notes.md`).
     /// NOTE: Navigation deferred to post-MVP.
     FilePath(PathBuf),
+
+    /// An inline image (e.g. `![alt](url)`).
+    ///
+    /// Stored in the `LinkIndex` so that `render_preview_images` in `ui.rs` can find image source lines and URLs without a second parse pass.
+    /// Image entries are excluded from the `LinkSelect` follow action.
+    Image { url: String, alt: String },
 }
 
 impl LinkTarget {
@@ -64,7 +71,13 @@ impl LinkTarget {
             Self::InternalAnchor(a) => a.as_str(),
             Self::WikiLink(w) => w.as_str(),
             Self::FilePath(p) => p.to_str().unwrap_or("(invalid path)"),
+            Self::Image { url, .. } => url.as_str(),
         }
+    }
+
+    /// `true` when this target can be followed/navigated (i.e., it is not an image).
+    pub fn is_navigable(&self) -> bool {
+        !matches!(self, Self::Image { .. })
     }
 }
 
@@ -117,7 +130,7 @@ impl LinkIndex {
         self.0.is_empty()
     }
 
-    /// Total number of links in the index.
+    /// Total number of links in the index (including image entries).
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -125,6 +138,26 @@ impl LinkIndex {
     /// Return the link at `index` if one exists.
     pub fn get(&self, index: usize) -> Option<&Link> {
         self.0.get(index)
+    }
+
+    /// Number of navigable (non-image) links.
+    ///
+    /// Used by `LinkSelect` mode so image entries don't inflate the counter.
+    pub fn navigable_len(&self) -> usize {
+        self.0.iter().filter(|l| l.target.is_navigable()).count()
+    }
+
+    /// Iterate over image entries only.
+    ///
+    /// Returns an iterator of `(source_line, url, alt)` entries.
+    pub fn images(&self) -> impl Iterator<Item = (usize, &str, &str)> {
+        self.0.iter().filter_map(|l| {
+            if let LinkTarget::Image { url, alt } = &l.target {
+                Some((l.source_line, url.as_str(), alt.as_str()))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -194,6 +227,24 @@ mod tests {
         let t = LinkTarget::from_href("docs/overview.md");
 
         assert!(matches!(t, LinkTarget::FilePath(_)));
+    }
+
+    // LinkTarget::is_navigable
+
+    #[test]
+    fn external_is_navigable() {
+        assert!(LinkTarget::External("https://x.com".into()).is_navigable());
+    }
+
+    #[test]
+    fn image_is_not_navigable() {
+        assert!(
+            !LinkTarget::Image {
+                url: "img.png".into(),
+                alt: "alt".into()
+            }
+            .is_navigable()
+        );
     }
 
     // normalize_anchor
@@ -267,6 +318,55 @@ mod tests {
         assert!(idx.get(2).is_none());
     }
 
+    #[test]
+    fn navigable_len_excludes_images() {
+        let mut idx = LinkIndex::new();
+        idx.push(Link {
+            display_text: "Link".into(),
+            target: LinkTarget::External("https://x.com".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        idx.push(Link {
+            display_text: "photo".into(),
+            target: LinkTarget::Image {
+                url: "photo.png".into(),
+                alt: "a photo".into(),
+            },
+            source_line: 1,
+            source_col: 0,
+        });
+
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.navigable_len(), 1, "images must not count as navigable");
+    }
+
+    #[test]
+    fn images_iterator_yields_only_image_entries() {
+        let mut idx = LinkIndex::new();
+        idx.push(Link {
+            display_text: "Link".into(),
+            target: LinkTarget::External("https://x.com".into()),
+            source_line: 0,
+            source_col: 0,
+        });
+        idx.push(Link {
+            display_text: "photo".into(),
+            target: LinkTarget::Image {
+                url: "photo.png".into(),
+                alt: "a photo".into(),
+            },
+            source_line: 2,
+            source_col: 0,
+        });
+
+        let images: Vec<_> = idx.images().collect();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, 2); // source_line
+        assert_eq!(images[0].1, "photo.png"); // url
+    }
+
     // display_str
 
     #[test]
@@ -288,5 +388,15 @@ mod tests {
         let t = LinkTarget::WikiLink("HomePage".into());
 
         assert_eq!(t.display_str(), "HomePage");
+    }
+
+    #[test]
+    fn image_display_str_is_url() {
+        let t = LinkTarget::Image {
+            url: "img.png".into(),
+            alt: "desc".into(),
+        };
+
+        assert_eq!(t.display_str(), "img.png");
     }
 }
