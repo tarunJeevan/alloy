@@ -664,7 +664,6 @@ impl<'h> RenderContext<'h> {
                     // Each line of a code block arrives as a separate Text event terminated by '\n'.
                     // Accumulate into buffer and emit highlighted lines in `end_code_block`.
                     self.code_block_content.push_str(s);
-                    // NOTE: Old code
                 } else if self.in_image {
                     // Alt text inside an image tag - accumulate, don't emit.
                     self.pending_image_alt.push_str(s);
@@ -716,7 +715,8 @@ impl<'h> RenderContext<'h> {
 
             // Task list checkbox
             Event::TaskListMarker(checked) => {
-                let mark = if checked { "☑ " } else { "☐ " };
+                // NOTE: Use ✅ and ⬜ if preferred
+                let mark = if checked { "✓ " } else { "☐ " };
                 let style = if checked {
                     Style::default().fg(Color::Green)
                 } else {
@@ -808,8 +808,8 @@ impl<'h> RenderContext<'h> {
                 let prefix = match kind {
                     ListKind::Unordered => {
                         let bullet = match depth {
-                            1 => "•",
-                            2 => "◦",
+                            1 => "●",
+                            2 => "○",
                             _ => "▸",
                         };
                         format!("{indent}{bullet} ")
