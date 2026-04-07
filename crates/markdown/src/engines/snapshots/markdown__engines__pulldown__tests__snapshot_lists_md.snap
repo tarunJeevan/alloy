@@ -10,12 +10,12 @@ expression: out
 
 
 
-• Alpha
-• Beta
-• Gamma
+● Alpha
+● Beta
+● Gamma
 
- ◦ Nested item one
- ◦ Nested item two
+ ○ Nested item one
+ ○ Nested item two
 
   ▸ Doubly nested
 
@@ -39,6 +39,6 @@ expression: out
 
 
 
-• ☑ Done item
-• ☐ Pending item
-• ☑ Another done item
+● ✓ Done item
+● ☐ Pending item
+● ✓ Another done item

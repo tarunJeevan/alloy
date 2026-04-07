@@ -1194,7 +1194,7 @@ mod tests {
         assert!(out.contains("alpha"), "list item alpha missing: {out:?}");
         assert!(out.contains("beta"), "list item beta missing: {out:?}");
         assert!(
-            out.contains('•') || out.contains('-') || out.contains('◦'),
+            out.contains('●') || out.contains('-') || out.contains('○'),
             "list bullet missing: {out:?}"
         );
     }
