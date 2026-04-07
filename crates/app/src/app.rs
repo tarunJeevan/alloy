@@ -20,12 +20,12 @@
 //! - startup: `Document::content()` -> seeds `TextArea`
 //! - save: `TextArea::lines().join("\n")` -> `Document::save()`
 
-use std::path::PathBuf;
-use std::sync::{
-    Arc, Mutex,
-    mpsc::{Receiver, SyncSender},
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::mpsc::{Receiver, SyncSender},
+    time::{Duration, Instant},
 };
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::{
@@ -33,7 +33,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::Text,
 };
-use ratatui_image::picker::Picker;
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use ratatui_textarea::{CursorMove, TextArea};
 
 use alloy_core::{
@@ -44,7 +44,7 @@ use alloy_core::{
     search::{LARGE_DOC_THRESHOLD_BYTES, SearchKind, SearchState},
 };
 
-use crate::image_cache::ImageCache;
+use crate::image_encoder::{EncodeRequest, EncodeResult, spawn_encoder};
 use crate::image_proto::DetectedImageProtocol;
 use crate::keymap::{EditorAction, KeymapDispatcher};
 use crate::preview_worker::{RenderRequest, RenderResult, WorkerExtensions, spawn_worker};
@@ -150,12 +150,16 @@ pub struct App {
     /// Image protocol detected from terminal at startup.
     pub detected_image_protocol: DetectedImageProtocol,
 
-    /// ratatui-image Picker for protocol-specific image encoding.
-    /// `None` when images are disabled or `DetectedImageProtocol::None`.
-    pub picker: Option<Arc<Mutex<Picker>>>,
+    /// Protocol-encoded images ready for `render_stateful_widget`.
+    pub protocol_cache: HashMap<String, StatefulProtocol>,
 
-    /// LRU cache of decoded + protocol-encoded images. Shared with the preview worker.
-    pub image_cache: Arc<Mutex<ImageCache>>,
+    /// Sender to the protocol-encoding thread.
+    /// `None` when images are disabled.
+    encode_request_sender: Option<SyncSender<EncodeRequest>>,
+
+    /// Receiver for protocol-encoded images from the encoding thread.
+    /// Drained non-blockingly in `tick()`.
+    encode_result_receiver: Option<Receiver<EncodeResult>>,
 
     // Preview state
     /// Which preview mode is currently active.
@@ -248,9 +252,13 @@ impl App {
             .map(map_picker_to_be_detected)
             .unwrap_or(DetectedImageProtocol::None);
 
-        // Wrap the picker in Arc<Mutex> so it can be shared with the render closure.
-        let picker: Option<Arc<Mutex<Picker>>> = picker.map(|p| Arc::new(Mutex::new(p)));
-        let image_cache = Arc::new(Mutex::new(ImageCache::new(20)));
+        let (encode_request_sender, encode_result_receiver) = match picker {
+            Some(p) => {
+                let (tx, rx) = spawn_encoder(p);
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
 
         // Spawn the background render thread.
         let (request_sender, result_receiver, worker_handle) =
@@ -271,8 +279,9 @@ impl App {
             link_cursor: 0,
             hyperlinks_supported,
             detected_image_protocol,
-            picker,
-            image_cache,
+            encode_request_sender,
+            encode_result_receiver,
+            protocol_cache: HashMap::new(),
             preview_mode: PreviewMode::Rendered,
             preview_scroll: 0,
             preview_scroll_html: 0,
@@ -314,10 +323,20 @@ impl App {
     /// Increments `doc_revision` and uses `try_send` - silently drops if the bounded channel is full (the next edit will trigger a new request).
     pub fn send_render_request(&mut self) {
         self.doc_revision += 1;
+
+        let base_dir = self
+            .document
+            .path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf());
+
         let req = RenderRequest {
             revision: self.doc_revision,
             markdown: self.textarea_content(),
             col_width: self.last_preview_width,
+            base_dir,
+            fetch_remote: self.config.images.fetch_remote,
         };
 
         // Silently drop if the channel is full - the next edit will trigger a new request.
@@ -447,12 +466,39 @@ impl App {
                 self.preview_html = result.html;
                 self.link_index = result.link_index;
 
+                // Send newly-arrived DynamicImages to the encoder thread.
+                if let Some(tx) = &self.encode_request_sender {
+                    for (url, dyn_img) in result.loaded_images {
+                        // Skip if already cached.
+                        if self.protocol_cache.contains_key(&url) {
+                            continue;
+                        }
+                        let _ = tx.try_send(EncodeRequest {
+                            key: url,
+                            image: dyn_img,
+                        });
+                    }
+                }
+
                 // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
                 // Users can scroll back down with Ctrl+f.
                 // NOTE: Uncomment if the auto-reset behavior is desired:
                 // self.preview_scroll = 0;
             }
             // Stale results (revision mismatch) are silently discarded.
+        }
+
+        // Drain encoder results
+        if let Some(rx) = &self.encode_result_receiver {
+            while let Ok(result) = rx.try_recv() {
+                // Evict oldest entry when at capacity.
+                if self.protocol_cache.len() >= 20
+                    && let Some(oldest) = self.protocol_cache.keys().next().cloned()
+                {
+                    self.protocol_cache.remove(&oldest);
+                }
+                self.protocol_cache.insert(result.key, result.protocol);
+            }
         }
 
         Ok(())
@@ -1034,14 +1080,14 @@ impl App {
     pub fn images_enabled(&self) -> bool {
         self.config.images.enabled
             && self.detected_image_protocol != DetectedImageProtocol::None
-            && self.picker.is_some()
+            && self.encode_request_sender.is_some()
     }
 
     /// Invalidate image cache on terminal resize.
     pub fn on_resize(&mut self) {
-        if let Ok(mut cache) = self.image_cache.lock() {
-            cache.invalidate_all();
-        }
+        // Clear the protocol cache after resize.
+        self.protocol_cache.clear();
+        tracing::debug!("protocol_cache cleared on terminal resize");
     }
 }
 

@@ -11,6 +11,7 @@
 pub mod app;
 pub mod cli;
 pub mod image_cache;
+pub mod image_encoder;
 pub mod image_proto;
 pub mod keymap;
 pub mod preview_worker;

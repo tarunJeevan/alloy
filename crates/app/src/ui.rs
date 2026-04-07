@@ -227,37 +227,31 @@ fn preview_block(title: &'static str, border_color: Color) -> Block<'static> {
 fn render_preview_images(frame: &mut Frame, app: &mut App, inner: Rect) {
     use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
 
-    // Collect image URLs from the link index with `LinkIndex::images()`.
-    let image_entries: Vec<(usize, String)> = app
-        .link_index
-        .images()
-        .map(|(source_line, url, _alt)| (source_line, url.to_owned()))
-        .collect();
-
-    if image_entries.is_empty() {
-        return;
+    if app.protocol_cache.is_empty() {
+        return; // Nothing loaded yet
     }
 
-    let Some(picker_arc) = &app.picker else {
-        return;
-    };
-    let Ok(mut picker) = picker_arc.lock() else {
-        return;
-    };
-    let Ok(mut cache) = app.image_cache.lock() else {
-        return;
-    };
-
-    let fetch_remote = app.config.images.fetch_remote;
-    let base_dir = app.document.path.as_deref().and_then(|p| p.parent());
     let scroll = app.preview_scroll as usize;
 
-    for (source_line, url) in &image_entries {
-        // Map source line -> rendered row, accounting for scroll offset.
-        let row = source_line.saturating_sub(scroll);
-        if row >= inner.height as usize {
-            continue; // Image scrolled off screen
-        }
+    // Collect image URLs from the link index with `LinkIndex::images()`.
+    let visible: Vec<(usize, String)> = app
+        .link_index
+        .images()
+        .filter_map(|(source_line, url, _alt)| {
+            let row = source_line.saturating_sub(scroll);
+            if row < inner.height as usize {
+                Some((row, url.to_owned()))
+            } else {
+                None // Scrolled off screen
+            }
+        })
+        .collect();
+
+    for (row, url) in visible {
+        // Look up the pre-encoded StatefulProtocol. If the image hasn't arrived from the worker yet, skip silently.
+        let Some(protocol) = app.protocol_cache.get_mut(&url) else {
+            continue;
+        };
 
         // Reserve a rendering area for image. Position one row below the placeholder span.
         // The +1 skips the placeholder text line itself.
@@ -274,17 +268,9 @@ fn render_preview_images(frame: &mut Frame, app: &mut App, inner: Rect) {
             height: img_height,
         };
 
-        // Load / decode / protocol-encode via the cache.
-        if let Err(e) = cache.get_or_load(url, &mut picker, fetch_remote, base_dir) {
-            tracing::debug!(url, error = %e, "image: load failed; using placeholder");
-            continue;
-        }
-
-        // Mutable re-lookup for render_stateful_widget.
-        if let Some(entry) = cache.get_mut(url) {
-            let widget = StatefulImage::<StatefulProtocol>::default();
-            frame.render_stateful_widget(widget, img_rect, &mut entry.protocol);
-        }
+        // Encode the image via StatefulImage.
+        let widget = StatefulImage::<StatefulProtocol>::default();
+        frame.render_stateful_widget(widget, img_rect, protocol);
     }
 }
 
