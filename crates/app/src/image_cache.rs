@@ -69,6 +69,7 @@ impl std::fmt::Display for ImageLoadError {
         }
     }
 }
+
 // ------------------------------------------------------------
 // Cache entry
 // ------------------------------------------------------------
@@ -194,7 +195,7 @@ impl ImageCache {
 /// Classification:
 /// - "http://" OR "https://" -> remote fetch (gated by `fetch_remote`)
 /// - Anything else -> filepath resolved relative to `base_dir`
-fn load_image(
+pub(crate) fn load_image(
     key: &str,
     fetch_remote: bool,
     base_dir: Option<&Path>,

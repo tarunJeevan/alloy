@@ -622,21 +622,28 @@ impl<'h> RenderContext<'h> {
 
     /// Called on `End(TagEnd::Image)`.
     ///
-    /// Emits a styled placeholder span and resets image state.
-    ///
-    /// Placeholder format:
-    /// - With alt text: `[Image: alt text (url)]`
-    /// - Without alt text: `[Image: url]`
+    /// 1. Pushes a `LinkTarget::Image` entry into `link_index` so `render_preview_images` in `ui.rs` can find the image source line and URL without a second parse pass.
+    /// 2. Emits a styled placeholder span that acts as a layout anchor: the actual `StatefulImage` widget is drawn on top of it by `render_preview_images`.
     fn end_image(&mut self) {
-        let label = if self.pending_image_alt.trim().is_empty() {
-            // No alt text - just show the URL
-            format!("[Image: {}]", self.pending_image_url)
+        let url = self.pending_image_url.clone();
+        let alt = self.pending_image_alt.trim().to_owned();
+
+        // Register in the link index so the UI renderer can locate images.
+        self.link_index.push(Link {
+            display_text: alt.clone(),
+            target: LinkTarget::Image {
+                url: url.clone(),
+                alt: alt.clone(),
+            },
+            source_line: self.current_source_line(),
+            source_col: 0,
+        });
+
+        // Emit a placeholder span that reserves vertical space.
+        let label = if alt.is_empty() {
+            format!("[Image: {url}]")
         } else {
-            format!(
-                "[Image: {} ({})]",
-                self.pending_image_alt.trim(),
-                self.pending_image_url
-            )
+            format!("[Image: {alt} ({url})]",)
         };
 
         self.current_spans.push(Span::styled(
@@ -664,7 +671,6 @@ impl<'h> RenderContext<'h> {
                     // Each line of a code block arrives as a separate Text event terminated by '\n'.
                     // Accumulate into buffer and emit highlighted lines in `end_code_block`.
                     self.code_block_content.push_str(s);
-                    // NOTE: Old code
                 } else if self.in_image {
                     // Alt text inside an image tag - accumulate, don't emit.
                     self.pending_image_alt.push_str(s);
@@ -716,7 +722,8 @@ impl<'h> RenderContext<'h> {
 
             // Task list checkbox
             Event::TaskListMarker(checked) => {
-                let mark = if checked { "☑ " } else { "☐ " };
+                // NOTE: Use ✅ and ⬜ if preferred
+                let mark = if checked { "✓ " } else { "☐ " };
                 let style = if checked {
                     Style::default().fg(Color::Green)
                 } else {
@@ -808,8 +815,8 @@ impl<'h> RenderContext<'h> {
                 let prefix = match kind {
                     ListKind::Unordered => {
                         let bullet = match depth {
-                            1 => "•",
-                            2 => "◦",
+                            1 => "●",
+                            2 => "○",
                             _ => "▸",
                         };
                         format!("{indent}{bullet} ")
@@ -1187,7 +1194,7 @@ mod tests {
         assert!(out.contains("alpha"), "list item alpha missing: {out:?}");
         assert!(out.contains("beta"), "list item beta missing: {out:?}");
         assert!(
-            out.contains('•') || out.contains('-') || out.contains('◦'),
+            out.contains('●') || out.contains('-') || out.contains('○'),
             "list bullet missing: {out:?}"
         );
     }

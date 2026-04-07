@@ -8,7 +8,7 @@
 //!
 //! `TestBackend` never touches the real terminal so these tests are safe to run on all platforms and in CI without a PTY.
 
-use alloy_app::{App, DetectedImageProtocol, EditorAction, PreviewMode};
+use alloy_app::{App, EditorAction, PreviewMode};
 use alloy_core::{config::Config, document::Document};
 
 use ratatui::{Terminal, backend::TestBackend};
@@ -21,11 +21,7 @@ use ratatui::{Terminal, backend::TestBackend};
 ///
 /// Uses `DetectedImageProtocol::None` so no image protocol detection runs and `Config::default()` so no disk I/O is needed.
 fn make_test_app() -> App {
-    App::new(
-        Config::default(),
-        Document::new(),
-        DetectedImageProtocol::None,
-    )
+    App::new(Config::default(), Document::new(), None)
 }
 
 /// Collect all call symbols from the terminal buffer into a single `String`.
@@ -82,7 +78,7 @@ fn app_renders_with_document_content() {
     let path = tmp.path().to_path_buf();
 
     let doc = Document::open(&path).expect("open temp file");
-    let mut app = App::new(Config::default(), doc, DetectedImageProtocol::None);
+    let mut app = App::new(Config::default(), doc, None);
 
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).unwrap();

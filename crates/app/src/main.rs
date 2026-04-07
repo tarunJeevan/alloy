@@ -4,6 +4,7 @@
 //! - Parse CLI args
 //! - Load user config
 //! - Open the initial document (or create an empty one)
+//! - Detect the terminal image protocol and build a `Picker`
 //! - Set up the terminal (raw mode, alternate screen, panic hook)
 //! - Run the event loop
 //! - Restore the terminal on exit (clean path AND panic path)
@@ -20,8 +21,9 @@ use ratatui::{
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
 };
+use ratatui_image::picker::Picker;
 
-use alloy_app::{App, CliArgs, DetectedImageProtocol, image_proto::detect_from_env, ui};
+use alloy_app::{App, CliArgs, image_proto::detect_from_env, ui};
 use alloy_core::{config::Config, document::Document};
 
 // Terminal lifecycle
@@ -63,23 +65,23 @@ fn main() -> Result<()> {
     };
 
     // Detect image protocols supported by the terminal and use the most suitable one.
-    let detected_image_protocol = {
+    let picker = {
         if !config.images.enabled
             || config.images.protocol == alloy_core::config::ImageProtocol::Off
         {
             // Detection disabled by config.
             tracing::debug!("image: protocol detection skipped (disabled in config)");
-            DetectedImageProtocol::None
+            None
         } else {
             // Attempt full ratatui-image Picker detection with a timeout.
-            detect_protocol_with_timeout(Duration::from_millis(200))
+            detect_picker(Duration::from_millis(200))
         }
     };
 
-    tracing::debug!(protocol = ?detected_image_protocol, "image protocol detection complete");
+    tracing::debug!(protocol = ?picker.as_ref().map(|p| p.protocol_type()), "image protocol detection complete");
 
     // Build app - initialize app state with config and opened document
-    let mut app = App::new(config, document, detected_image_protocol);
+    let mut app = App::new(config, document, picker);
 
     // Terminal setup - enable raw mode and enter alt screen
     enable_raw_mode().context("failed to enable raw mode")?;
@@ -105,61 +107,80 @@ fn main() -> Result<()> {
 }
 
 // ------------------------------------------------------------
-// Config-level gating
+// Image protocol detection
 // ------------------------------------------------------------
 
 /// Attempt image protocol detection via `ratatui-image`'s Picker, with a thread + timeout guard.
 ///
-/// On success, maps the detected `Picker` into our `DetectedImageProtocol` enum.
+/// On success, returns the detected `Picker`.
 /// On timeout or error (common in tmux, screen), falls back to env-var heuristics.
-fn detect_protocol_with_timeout(timeout: Duration) -> DetectedImageProtocol {
-    use ratatui_image::picker::Picker;
+fn detect_picker(timeout: Duration) -> Option<Picker> {
     use std::sync::mpsc;
 
-    let (tx, rx) = mpsc::channel::<Result<DetectedImageProtocol, String>>();
+    let (tx, rx) = mpsc::channel::<Result<Picker, String>>();
 
     // Run 'Picker::from_query_stdio()' on a dedicated thread so we can enforce a timeout.
     // The thread sends its result back via the channel.
     std::thread::spawn(move || {
-        let result = match Picker::from_query_stdio() {
-            Ok(picker) => Ok(map_picker_protocol(&picker)),
-            Err(e) => {
-                tracing::debug!("ratatui-image picker detection failed: {e}");
-                Err(e.to_string())
-            }
-        };
+        let result = Picker::from_query_stdio().map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
-        Ok(Ok(proto)) => proto,
-        Ok(Err(_picker_err)) => {
+        Ok(Ok(picker)) => {
+            tracing::debug!(
+            protocol = ?picker.protocol_type(),
+            font_size = ?picker.font_size(),
+            "image: Picker::from_query_stdio succeeded"
+            );
+            Some(picker)
+        }
+        Ok(Err(e)) => {
             // Picker query failed - fall back to env-var heuristics.
-            tracing::debug!("picker failed; falling back to env-var detection");
-            detect_from_env()
+            tracing::debug!(
+                "image: Picker::from_query_stdio failed ({e}); falling back to env-var detection"
+            );
+            picker_from_env()
         }
         Err(_timeout) => {
             // Timed out (likely tmux/screen) - fall back to env-var heuristics.
             tracing::warn!(
-                "image protocol detection timed out after {}ms; using env-var heuristics",
+                "image: protocol detection timed out after {}ms; using env-var heuristics",
                 timeout.as_millis()
             );
-            detect_from_env()
+            picker_from_env()
         }
     }
 }
 
-/// Map a ratatui-image Picker's detected protocol to our DetectedImageProtocol.
-fn map_picker_protocol(picker: &ratatui_image::picker::Picker) -> DetectedImageProtocol {
+/// Construct a `Picker` based solely on env-var heuristics.
+///
+/// Used as a fallback when `Picker::from_query_stdio` is unavailable or times out.
+/// Font size defaults to (8, 16). Images will still render but may be proportioned slightly differently.
+fn picker_from_env() -> Option<Picker> {
+    use alloy_app::image_proto::DetectedImageProtocol;
     use ratatui_image::picker::ProtocolType;
 
-    // Picker::protocol() returns the detected Protocol variant.
-    match picker.protocol_type() {
-        ProtocolType::Kitty => DetectedImageProtocol::Kitty,
-        ProtocolType::Halfblocks => DetectedImageProtocol::HalfBlock,
-        _ => DetectedImageProtocol::HalfBlock,
-    }
+    let proto = detect_from_env();
+    tracing::debug!(?proto, "image: env-var fallback protocol");
+
+    // Start from a halfblocks base (always safe default), then override the protocol type to match what the env vars suggest.
+    let mut picker = Picker::halfblocks();
+    let protocol_type = match proto {
+        DetectedImageProtocol::Kitty => ProtocolType::Kitty,
+        DetectedImageProtocol::Iterm2 => ProtocolType::Iterm2,
+        DetectedImageProtocol::Sixel => ProtocolType::Sixel,
+        DetectedImageProtocol::HalfBlock => ProtocolType::Halfblocks,
+        DetectedImageProtocol::None => return None,
+    };
+
+    picker.set_protocol_type(protocol_type);
+    Some(picker)
 }
+
+// ------------------------------------------------------------
+// Event loop
+// ------------------------------------------------------------
 
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,

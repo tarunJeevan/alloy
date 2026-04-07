@@ -25,17 +25,23 @@
 //!
 //! - The request channel is BOUNDED (`sync_channel(4)`). The UI uses `try_send` and silently drops if the channel is full. The next keystroke will trigger a fresh request anyway. This ensures the worker is never starved of CPU by a backlog of stale render jobs.
 
-use std::sync::{
-    Arc,
-    mpsc::{Receiver, SyncSender, sync_channel},
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
+use image::DynamicImage;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
 
+use crate::image_cache::load_image;
 use alloy_core::{config::HighlightingConfig, links::LinkIndex};
 use markdown::{
     ComrakEngine, ComrakExtensions, MarkdownEngine, PulldownEngine,
@@ -95,6 +101,12 @@ pub struct RenderRequest {
 
     /// Width of the preview pane in terminal columns.
     pub col_width: u16,
+
+    /// Directory of the currently open doc.
+    pub base_dir: Option<PathBuf>,
+
+    /// Whether online URLs should be fetched. Mirrors `config.images.fetch_remote`.
+    pub fetch_remote: bool,
 }
 
 /// A render result sent from the worker back to the UI thread.
@@ -115,6 +127,9 @@ pub struct RenderResult {
     ///
     /// Built for free during `render_terminal_with_links` - no extra parse cost.
     pub link_index: LinkIndex,
+
+    /// Images pre-loaded on the worker thread.
+    pub loaded_images: HashMap<String, DynamicImage>,
 }
 
 // ---------------------------------------------------------
@@ -209,6 +224,8 @@ fn worker_loop(
         let revision = current.revision;
         let col_width = current.col_width;
         let markdown = current.markdown.clone();
+        let base_dir = current.base_dir.clone();
+        let fetch_remote = current.fetch_remote;
 
         // A newtype wrapper to unconditionally implement UnwindSafe on MarkdownEngine to satisfy compiler requirements.
         use std::panic::AssertUnwindSafe;
@@ -242,6 +259,9 @@ fn worker_loop(
                 }
             };
 
+        // Image pre-loading.
+        let loaded_images = preload_images(&link_index, base_dir.as_deref(), fetch_remote);
+
         // Send the result. If the UI has dropped its receiver (app is shutting down), exit.
         if res_tx
             .send(RenderResult {
@@ -249,6 +269,7 @@ fn worker_loop(
                 rendered,
                 html,
                 link_index,
+                loaded_images,
             })
             .is_err()
         {
@@ -256,6 +277,35 @@ fn worker_loop(
             return;
         }
     }
+}
+
+/// Load every image referenced in `link_index` and return the decoded images.
+///
+/// Failures are logged at DEBUG level and excluded from the returned map - the UI will display the existing placeholder span for those images.
+fn preload_images(
+    link_index: &LinkIndex,
+    base_dir: Option<&std::path::Path>,
+    fetch_remote: bool,
+) -> HashMap<String, DynamicImage> {
+    let mut map = HashMap::new();
+
+    for (source_line, url, alt) in link_index.images() {
+        if map.contains_key(url) {
+            continue; // deduplicate
+        }
+
+        match load_image(url, fetch_remote, base_dir) {
+            Ok(img) => {
+                tracing::debug!(url, source_line, alt, "image: pre-loaded on worker thread");
+                map.insert(url.to_owned(), img);
+            }
+            Err(e) => {
+                tracing::debug!(url, error = %e, "image: pre-load failed; using placeholder");
+            }
+        }
+    }
+
+    map
 }
 
 /// Drain the request channel until a `recv_timeout` fires (no new request within `debounce`).
@@ -318,6 +368,8 @@ mod tests {
             revision,
             markdown: format!("# Revision {revision}\n\nSome content."),
             col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
         }
     }
 
@@ -373,6 +425,8 @@ mod tests {
             revision: 1,
             markdown: "# Hello Alloy\n\nSome paragraph.\n".to_owned(),
             col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
         })
         .unwrap();
 
@@ -402,6 +456,8 @@ mod tests {
             revision: 1,
             markdown: "# My Heading\n\nParagraph text.\n".to_owned(),
             col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
         })
         .unwrap();
 
@@ -423,6 +479,8 @@ mod tests {
             revision: 1,
             markdown: "# Intro\n\nSee [Example](https://example.com) for more.\n".to_owned(),
             col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
         })
         .unwrap();
 
@@ -449,6 +507,8 @@ mod tests {
             revision: 1,
             markdown: "Just plain text, no links.\n".to_owned(),
             col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
         })
         .unwrap();
 
@@ -464,6 +524,52 @@ mod tests {
             .count();
 
         assert_eq!(external_count, 0);
+    }
+
+    #[test]
+    fn loaded_images_empty_when_no_images_in_markdown() {
+        let (tx, rx, _handle) = spawn_worker(30, default_extensions());
+
+        tx.try_send(RenderRequest {
+            revision: 1,
+            markdown: "Just text, [a link](https://example.com).\n".to_owned(),
+            col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+
+        let result = rx.try_recv().expect("expected a result");
+
+        assert!(
+            result.loaded_images.is_empty(),
+            "no images in source → loaded_images must be empty"
+        );
+    }
+
+    #[test]
+    fn loaded_images_empty_for_nonexistent_local_path() {
+        // Worker must not panic when an image path doesn't exist.
+        let (tx, rx, _handle) = spawn_worker(30, default_extensions());
+
+        tx.try_send(RenderRequest {
+            revision: 1,
+            markdown: "![alt](/nonexistent/does_not_exist.png)\n".to_owned(),
+            col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+
+        let result = rx.try_recv().expect("expected a result");
+
+        // Load error → entry absent from map, no panic.
+        assert!(
+            result.loaded_images.is_empty(),
+            "missing image file should yield empty loaded_images, not a panic"
+        );
     }
 
     /// Verify the debounce actually coalesces rapid requests - if we send N requests quickly, we should receive far fewer than N results (ideally 1).
@@ -515,6 +621,8 @@ mod tests {
             revision: 1,
             markdown: "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n".to_owned(),
             col_width: 80,
+            base_dir: None,
+            fetch_remote: false,
         })
         .unwrap();
 
