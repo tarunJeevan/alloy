@@ -259,8 +259,23 @@ fn worker_loop(
                 }
             };
 
-        // Image pre-loading.
-        let loaded_images = preload_images(&link_index, base_dir.as_deref(), fetch_remote);
+        // Image pre-loading — wrapped in catch_unwind so a panic in load_image()
+        // (e.g. from a malformed image file) does not kill the worker thread.
+        let loaded_images = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            preload_images(&link_index, base_dir.as_deref(), fetch_remote)
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("(non-string panic payload)");
+            tracing::error!(
+                panic = msg,
+                "image preload panicked — returning empty image set"
+            );
+            HashMap::new()
+        });
 
         // Send the result. If the UI has dropped its receiver (app is shutting down), exit.
         if res_tx

@@ -81,15 +81,34 @@ impl Document {
     /// This replaces the internal Rope and writes to disk.
     ///
     /// Returns `CoreError::DocumentNoPath` if no path is set - callers should use `save_as` in that case.
-    #[instrument(skip(self, content), fields(path = ?self.path))]
+    #[instrument(skip_all)]
     pub fn save(&mut self, content: &str) -> Result<(), CoreError> {
+        tracing::debug!(
+            filename = self
+                .path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .as_deref()
+                .unwrap_or("[unnamed]"),
+            "saving document"
+        );
         let path = self.path.clone().ok_or(CoreError::DocumentNoPath)?;
         self.save_as(content, path)
     }
 
     /// Save the current content to an explicit path and update `self.path`.
-    #[instrument(skip(self, content), fields(path = %path.as_ref().display()))]
+    #[instrument(skip_all)]
     pub fn save_as(&mut self, content: &str, path: impl AsRef<Path>) -> Result<(), CoreError> {
+        tracing::debug!(
+            filename = path
+                .as_ref()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .as_deref()
+                .unwrap_or("[unnamed]"),
+            "saving document as"
+        );
         let path = path.as_ref();
 
         // Write via a BufWrite - ropey's chunk iterator feeds it without a full string copy.

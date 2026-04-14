@@ -311,6 +311,14 @@ impl App {
             tracing::debug!("image: no graphics protocol detected; using halfblock fallback");
         }
 
+        if app.config.images.fetch_remote {
+            app.notify_warn(
+                "Remote image fetching is enabled (images.fetch_remote = true). \
+                 Opening untrusted documents may trigger outbound HTTP requests \
+                 to external servers.",
+            );
+        }
+
         app
     }
 
@@ -460,32 +468,48 @@ impl App {
         self.notifications.retain(|n| n.expires_at > now);
 
         // Drain render results - apply only if the revision matches.
-        while let Ok(result) = self.result_receiver.try_recv() {
-            if result.revision == self.doc_revision {
-                self.preview_text = result.rendered;
-                self.preview_html = result.html;
-                self.link_index = result.link_index;
+        loop {
+            match self.result_receiver.try_recv() {
+                Ok(result) => {
+                    if result.revision == self.doc_revision {
+                        self.preview_text = result.rendered;
+                        self.preview_html = result.html;
+                        self.link_index = result.link_index;
 
-                // Send newly-arrived DynamicImages to the encoder thread.
-                if let Some(tx) = &self.encode_request_sender {
-                    for (url, dyn_img) in result.loaded_images {
-                        // Skip if already cached.
-                        if self.protocol_cache.contains_key(&url) {
-                            continue;
+                        // Send newly-arrived DynamicImages to the encoder thread.
+                        if let Some(tx) = &self.encode_request_sender {
+                            for (url, dyn_img) in result.loaded_images {
+                                // Skip if already cached.
+                                if self.protocol_cache.contains_key(&url) {
+                                    continue;
+                                }
+                                let _ = tx.try_send(EncodeRequest {
+                                    key: url,
+                                    image: dyn_img,
+                                });
+                            }
                         }
-                        let _ = tx.try_send(EncodeRequest {
-                            key: url,
-                            image: dyn_img,
-                        });
-                    }
-                }
 
-                // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
-                // Users can scroll back down with Ctrl+f.
-                // NOTE: Uncomment if the auto-reset behavior is desired:
-                // self.preview_scroll = 0;
+                        // Reset scroll to top when the document changes enough to produce a new render. This avoids the preview being stuck scrolled past the end.
+                        // Users can scroll back down with Ctrl+f.
+                        // NOTE: Uncomment if the auto-reset behavior is desired:
+                        // self.preview_scroll = 0;
+                    }
+                    // Stale results (revision mismatch) are silently discarded.
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::error!(
+                        "preview worker channel disconnected — \
+                         worker has likely panicked; live preview is stopped"
+                    );
+                    self.notify_error(
+                        "Preview worker stopped unexpectedly. \
+                         Restart alloy to restore live preview.",
+                    );
+                    break;
+                }
             }
-            // Stale results (revision mismatch) are silently discarded.
         }
 
         // Drain encoder results
@@ -823,7 +847,7 @@ impl App {
 
         match target {
             LinkTarget::External(url) => {
-                tracing::info!(url, "opening external link in browser");
+                tracing::debug!(url, "opening external link in browser");
                 let url_clone = url.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = webbrowser::open(&url) {
@@ -979,7 +1003,17 @@ impl App {
         self.document
             .save(&content)
             .context("failed to write file")?;
-        tracing::info!(path = ?self.document.path, "document saved");
+        tracing::debug!(
+            filename = self
+                .document
+                .path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .as_deref()
+                .unwrap_or("[unnamed]"),
+            "document saved"
+        );
         Ok(())
     }
 

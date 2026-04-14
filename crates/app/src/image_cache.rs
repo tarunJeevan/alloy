@@ -26,11 +26,11 @@
 use std::{
     collections::HashMap,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Instant,
 };
 
-use image::DynamicImage;
+use image::{DynamicImage, ImageReader};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
@@ -209,9 +209,12 @@ pub(crate) fn load_image(
     }
 }
 
+const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024; // 20 MB
+
 /// Fetch and decode a remote image URL via `ureq`.
 ///
-/// Respects the 5-sec timeout configured on the agent.
+/// Enforces a 5-second connect timeout, 30-second body receive timeout, a 20 MB body cap,
+/// and Content-Type validation before reading the body.
 /// Returns `ImageLoadError::RemoteFetchDisabled` immediately when `fetch_remote` is false.
 fn load_remote(url: &str, fetch_remote: bool) -> Result<DynamicImage, ImageLoadError> {
     if !fetch_remote {
@@ -220,48 +223,153 @@ fn load_remote(url: &str, fetch_remote: bool) -> Result<DynamicImage, ImageLoadE
 
     tracing::debug!(url, "image: fetching remote image");
 
-    // Build a ureq agent with a 5-sec timeout.
-    let agent = ureq::agent();
+    // ureq 3.x agent builder — AgentBuilder does not exist in ureq 3.x.
+    // All timeout methods take Option<Duration>.
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(5)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
 
     let mut response = agent
         .get(url)
         .call()
         .map_err(|e| ImageLoadError::Fetch(e.to_string()))?;
 
-    // Read the body bytes.
+    // Validate Content-Type before reading the body (F-04).
+    let ct = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !ct.starts_with("image/") {
+        return Err(ImageLoadError::Fetch(format!(
+            "server returned unexpected Content-Type: {ct:?} (expected image/*)"
+        )));
+    }
+
+    // Bounded body read — read +1 byte over the limit to distinguish "at limit" from "over limit".
     let mut bytes = Vec::new();
     response
         .body_mut()
         .as_reader()
+        .take(MAX_REMOTE_IMAGE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| ImageLoadError::Fetch(e.to_string()))?;
+
+    if bytes.len() > MAX_REMOTE_IMAGE_BYTES {
+        return Err(ImageLoadError::Fetch(format!(
+            "remote image body exceeds {MAX_REMOTE_IMAGE_BYTES}-byte limit"
+        )));
+    }
 
     decode_bytes(&bytes, url)
 }
 
-/// Load and deocde a local file path.
+/// Resolve a local image path relative to `base_dir`.
 ///
-/// Resolves relative paths against `base_dir` (the directory of the open document).
-fn load_local(path_str: &str, base_dir: Option<&Path>) -> Result<DynamicImage, ImageLoadError> {
-    let path = if Path::new(path_str).is_relative() {
-        base_dir
-            .map(|d| d.join(path_str))
-            .unwrap_or_else(|| PathBuf::from(path_str))
-    } else {
-        PathBuf::from(path_str)
+/// Security invariants (purely lexical, no filesystem calls):
+/// - Absolute paths are rejected.
+/// - `..` components that escape `base_dir` are rejected.
+/// - Windows UNC prefixes (`\\server\share`) are rejected via `Component::Prefix`.
+fn resolve_safe_image_path(
+    path_str: &str,
+    base_dir: Option<&Path>,
+) -> Result<PathBuf, ImageLoadError> {
+    let raw = Path::new(path_str);
+
+    if raw.is_absolute() {
+        return Err(ImageLoadError::Io(format!(
+            "absolute image paths are not permitted: {path_str:?}"
+        )));
+    }
+
+    let base = match base_dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| ImageLoadError::Io(e.to_string()))?,
     };
 
+    let mut resolved = base.clone();
+    for component in raw.components() {
+        match component {
+            Component::Normal(seg) => resolved.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(ImageLoadError::Io(format!(
+                        "image path traversal detected (reached root): {path_str:?}"
+                    )));
+                }
+                if !resolved.starts_with(&base) {
+                    return Err(ImageLoadError::Io(format!(
+                        "image path escapes document directory: {path_str:?}"
+                    )));
+                }
+            }
+            // RootDir ("/") or Prefix ("C:\", "\\server\") inside a relative path should not occur after the is_absolute() check above, but guard defensively.
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ImageLoadError::Io(format!(
+                    "absolute component in image path: {path_str:?}"
+                )));
+            }
+        }
+    }
+
+    // Belt-and-suspenders final containment check.
+    if !resolved.starts_with(&base) {
+        return Err(ImageLoadError::Io(format!(
+            "image path escapes document directory (final check): {path_str:?}"
+        )));
+    }
+
+    Ok(resolved)
+}
+
+/// Load and decode a local file path.
+///
+/// Resolves relative paths against `base_dir` (the directory of the open document)
+/// with path traversal protection.
+fn load_local(path_str: &str, base_dir: Option<&Path>) -> Result<DynamicImage, ImageLoadError> {
+    let path = resolve_safe_image_path(path_str, base_dir)?;
     tracing::debug!(path = %path.display(), "image: loading local image");
-
     let bytes = std::fs::read(&path).map_err(|e| ImageLoadError::Io(e.to_string()))?;
-
     decode_bytes(&bytes, &path.display().to_string())
 }
 
+const MAX_IMAGE_DIMENSION_PX: u32 = 8_000;
+const MAX_IMAGE_DECODED_BYTES: usize = 64 * 1024 * 1024; // 64 MB RGBA worst-case
+
 /// Decode raw bytes into a `DynamicImage` using the `image` crate.
+///
+/// Performs a dimension pre-check before allocating pixel memory to guard against
+/// decompression bombs (e.g. a PNG claiming 65535x65535 pixels).
 fn decode_bytes(bytes: &[u8], source_label: &str) -> Result<DynamicImage, ImageLoadError> {
+    use std::io::Cursor;
+
+    // Dimension pre-check — no full pixel allocation at this point.
+    // `into_dimensions()` consumes the reader; the bytes slice remains accessible.
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ImageLoadError::Decode(e.to_string()))?;
+
+    if let Ok((w, h)) = reader.into_dimensions() {
+        if w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX {
+            return Err(ImageLoadError::Decode(format!(
+                "image {w}x{h} exceeds maximum {MAX_IMAGE_DIMENSION_PX}x{MAX_IMAGE_DIMENSION_PX} px"
+            )));
+        }
+        let estimate = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if estimate > MAX_IMAGE_DECODED_BYTES {
+            return Err(ImageLoadError::Decode(format!(
+                "image would require ~{estimate} decoded bytes, exceeding {MAX_IMAGE_DECODED_BYTES}-byte limit"
+            )));
+        }
+    }
+    // If `into_dimensions()` returns `Err`, fall through.
+    // Corrupt data fails safely at the decode step without consuming excess memory.
     image::load_from_memory(bytes).map_err(|e| {
-        tracing::debug!(source = source_label, error = %e, "image: decode failes");
+        tracing::debug!(source = source_label, error = %e, "image: decode failed");
         ImageLoadError::Decode(e.to_string())
     })
 }
@@ -340,5 +448,54 @@ mod tests {
         cache.invalidate_all();
 
         assert!(cache.entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod traversal_tests {
+    use super::*;
+
+    fn base() -> PathBuf {
+        PathBuf::from("/home/user/notes")
+    }
+
+    #[test]
+    fn allows_sibling_image() {
+        assert!(resolve_safe_image_path("img.png", Some(&base())).is_ok());
+    }
+
+    #[test]
+    fn allows_subdir_image() {
+        assert!(resolve_safe_image_path("assets/fig.png", Some(&base())).is_ok());
+    }
+
+    #[test]
+    fn allows_nested_subdir() {
+        assert!(resolve_safe_image_path("a/b/c/photo.jpg", Some(&base())).is_ok());
+    }
+
+    #[test]
+    fn allows_same_dir_dot() {
+        assert!(resolve_safe_image_path("./img.png", Some(&base())).is_ok());
+    }
+
+    #[test]
+    fn blocks_single_parent_escape() {
+        assert!(resolve_safe_image_path("../secret.png", Some(&base())).is_err());
+    }
+
+    #[test]
+    fn blocks_deep_escape() {
+        assert!(resolve_safe_image_path("a/../../etc/passwd", Some(&base())).is_err());
+    }
+
+    #[test]
+    fn blocks_absolute_path() {
+        assert!(resolve_safe_image_path("/etc/passwd", Some(&base())).is_err());
+    }
+
+    #[test]
+    fn blocks_root_only() {
+        assert!(resolve_safe_image_path("/", Some(&base())).is_err());
     }
 }
